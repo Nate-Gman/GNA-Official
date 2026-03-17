@@ -41,9 +41,2985 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Dict, Final, List, Optional, Protocol, Tuple
 
+import argparse
+import contextlib
+import datetime
+import ipaddress
+import math
+import queue
+import sqlite3
+import statistics
+import urllib.request
+from collections import Counter, defaultdict, deque
+from logging.handlers import RotatingFileHandler
+
 import io as _io
 import requests
 import socketio
+
+import psutil
+
+try:
+    from scapy.all import (
+        ARP, BOOTP, DHCP, DNS, IP, TCP, UDP,
+        Ether, IPv6, Raw, sniff, srp,
+    )
+    HAS_SCAPY = True
+except ImportError:
+    HAS_SCAPY = False
+
+_IS_WINDOWS = os.name == 'nt'
+if _IS_WINDOWS:
+    try:
+        import winreg
+        import ctypes
+        import ctypes.wintypes
+    except ImportError:
+        _IS_WINDOWS = False
+
+try:
+    import uvicorn
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse, JSONResponse
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+
+try:
+    import manuf
+    _PARSER = manuf.MacParser()
+    _HAS_MANUF = True
+except ImportError:
+    _HAS_MANUF = False
+    _PARSER = None
+
+try:
+    import geoip2.database as _geoip2_db
+    HAS_GEOIP2 = True
+except ImportError:
+    HAS_GEOIP2 = False
+
+_mb_logger = logging.getLogger('medianbox')
+
+
+# ===========================================================================
+# MEDIANBOX MONITOR v3.0 — FULL INTEGRATION (100% of medianbox_monitor_v2.py)
+# Modular Deductive Chess Engine for network security monitoring.
+# Deep process profiling + DNS-aware deductive chess.
+# Cross-references every process action with network traffic in real time.
+# ===========================================================================
+
+
+
+# ========================== USER CONFIG ==========================
+ALLOWED_APPS = {
+    "zoom": False, "google": True, "cloudflare": False, "teams": False,
+    "slack": False, "discord": False, "riot": True, "league": True,
+}
+
+MIMIC_KEYWORDS = {
+    "zoom":       ["zoom", "zmeet", "zoomus", "zoom.us"],
+    "google":     ["google", "gstatic", "googlevideo", "googleapis", "goog"],
+    "cloudflare": ["cloudflare", "cf-", "warp", "one.one"],
+    "teams":      ["teams", "microsoftonline", "microsoft365", "office365"],
+    "slack":      ["slack", "slack-edge"],
+    "discord":    ["discord", "discordapp", "dis.gd"],
+    "riot":       ["riot", "riotgames", "leagueoflegends"],
+    "league":     ["league", "lol", "lolesports"],
+    "chrome":     ["chrome", "chromium"],
+    "firefox":    ["firefox", "mozilla"],
+    "edge":       ["msedge", "microsoftedge"],
+}
+
+EXPECTED_EXE_PATHS = {
+    "chrome.exe":       [r"google\chrome\application"],
+    "firefox.exe":      [r"mozilla firefox"],
+    "msedge.exe":       [r"microsoft\edge\application"],
+    "zoom.exe":         [r"zoom\bin", r"zoom"],
+    "discord.exe":      [r"discord\app"],
+    "teams.exe":        [r"microsoft teams", r"teams"],
+    "slack.exe":        [r"slack\app"],
+    "riotclientservices.exe": [r"riot games"],
+    "leagueclient.exe": [r"riot games\league of legends"],
+    "league of legends.exe": [r"riot games\league of legends"],
+    "svchost.exe":      [r"windows\system32"],
+    "csrss.exe":        [r"windows\system32"],
+    "lsass.exe":        [r"windows\system32"],
+    "services.exe":     [r"windows\system32"],
+    "smss.exe":         [r"windows\system32"],
+    "winlogon.exe":     [r"windows\system32"],
+    "explorer.exe":     [r"windows"],
+    "taskhostw.exe":    [r"windows\system32"],
+    "conhost.exe":      [r"windows\system32"],
+    "dllhost.exe":      [r"windows\system32"],
+    "wininit.exe":      [r"windows\system32"],
+    "spoolsv.exe":      [r"windows\system32"],
+}
+
+EXPECTED_PARENTS = {
+    "svchost.exe":  ["services.exe"],
+    "csrss.exe":    ["smss.exe"],
+    "lsass.exe":    ["wininit.exe"],
+    "services.exe": ["wininit.exe"],
+    "smss.exe":     ["system"],
+    "winlogon.exe": ["smss.exe"],
+    "wininit.exe":  ["smss.exe"],
+    "taskhostw.exe": ["svchost.exe"],
+}
+
+KNOWN_SERVICE_RANGES = {
+    "riot":  ["104.160.128.0/17", "185.40.64.0/22", "162.249.72.0/21",
+              "103.10.8.0/22", "45.7.36.0/22"],
+    "google":["142.250.0.0/15", "172.217.0.0/16", "216.58.192.0/19",
+              "209.85.128.0/17", "74.125.0.0/16", "64.233.160.0/19",
+              "173.194.0.0/16", "108.177.0.0/17", "35.190.0.0/17"],
+    "cloudflare": ["104.16.0.0/13", "172.64.0.0/13", "131.0.72.0/22",
+                   "1.1.1.0/24", "1.0.0.0/24"],
+    "microsoft": ["13.64.0.0/11", "20.33.0.0/16", "20.40.0.0/13",
+                  "40.64.0.0/10", "52.96.0.0/12", "52.112.0.0/14"],
+    "discord": ["162.159.128.0/17", "66.22.196.0/22"],
+    "zoom":  ["3.7.35.0/25", "3.21.137.128/25", "3.22.11.0/24",
+              "8.5.128.0/23", "64.125.62.0/24", "64.211.144.0/24",
+              "65.39.152.0/24", "69.174.57.0/24", "147.124.96.0/19",
+              "170.114.0.0/16", "206.247.0.0/16", "209.9.211.0/24"],
+}
+
+HARDWARE_KEYWORDS = {
+    'audio':  ['audiodg', 'audioservice', 'pulseaudio', 'pipewire', 'rtkaudioservice'],
+    'camera': ['camerabrokersvc', 'frameworkservice', 'webcam', 'camerahelper'],
+}
+
+PERSISTENCE_KEYS = []
+if _IS_WINDOWS:
+    PERSISTENCE_KEYS = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ]
+
+SUSPICIOUS_DLL_PATHS = [
+    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp", "\\downloads\\",
+    "\\desktop\\", "\\public\\", "\\programdata\\", "\\users\\public",
+]
+
+# ========================== DEFAULT CONFIG ==========================
+CONFIG = {
+    'remote_ports': {22, 3389, 5900, 5938, 445, 139, 5985, 5986},
+    'probe_alert_ports': {21, 23, 80, 443, 445, 22, 3389, 5900},
+    'alert_cooldown': 75,
+    'deduction_cooldown': 120,
+    'db_file': 'medianbox_ultimate.db',
+    'log_file': 'medianbox_ultimate.log',
+    'actions_log': 'medianbox_full_actions.log',
+    'deductions_log': 'medianbox_deductions.log',
+    'process_scan_interval': 3,
+    'scan_interval_min': 5,
+    'scan_interval_max': 55,
+    'baseline_min_samples': 50,
+    'beacon_min_samples': 20,
+    'risk_critical': 70,
+    'risk_warning': 40,
+    'entropy_suspicious_threshold': 7.2,
+    'exfil_bytes_spike_factor': 10,
+    'exfil_min_bytes': 1_000_000,
+    'dns_tunnel_max_label_len': 50,
+    'dns_tunnel_entropy_threshold': 3.5,
+    'dns_tunnel_query_rate_threshold': 30,
+    'geoip_cache_ttl': 3600,
+    'geoip_enabled': True,
+    'high_risk_countries': {'CN', 'RU', 'KP', 'IR'},
+    'user_idle_threshold': 300,
+    'registry_scan_interval': 60,
+    'dll_scan_interval': 30,
+    'escalation_window': 300,
+    'escalation_multiplier': 1.5,
+    'siem_output': None,
+    'siem_host': '127.0.0.1',
+    'siem_port': 514,
+    'dashboard_enabled': True,
+    'dashboard_port': 8470,
+    'ml_baseline_window': 86400,
+    'ml_zscore_threshold': 3.0,
+    'config_file': 'medianbox_config.yaml',
+    'pipeline_workers': 2,
+    'pipeline_queue_size': 5000,
+    'dashboard_password': '',
+    'geoip_db_path': '',
+}
+
+EMOJI = {
+    'new': '🆕', 'alert': '🚨', 'remote': '🔌', 'probe': '🔍', 'kill': '☠️',
+    'ok': '✅', 'spoof': '🕵️', 'mimic': '🎭', 'foreign': '🌍', 'chess': '♟️',
+    'beacon': '📡', 'phantom': '👻', 'impersonate': '🥸', 'inject': '💉',
+    'anomaly': '📊', 'brain': '🧠', 'tunnel': '🕳️', 'exfil': '📤',
+    'entropy': '🔐', 'dll': '🧩', 'persist': '📌', 'geo': '🗺️',
+    'idle': '💤', 'ml': '🤖', 'escalate': '⬆️', 'dashboard': '📺',
+}
+
+
+class Colors:
+    G = '\033[92m'
+    Y = '\033[93m'
+    R = '\033[91m'
+    C = '\033[96m'
+    M = '\033[95m'
+    B = '\033[94m'
+    W = '\033[97m'
+    END = '\033[0m'
+
+
+# ========================== CONFIG SCHEMA & VALIDATION ==========================
+CONFIG_SCHEMA = {
+    'remote_ports':               {'type': set,   'elem': int},
+    'probe_alert_ports':          {'type': set,   'elem': int},
+    'alert_cooldown':             {'type': (int, float), 'min': 0},
+    'deduction_cooldown':         {'type': (int, float), 'min': 0},
+    'db_file':                    {'type': str},
+    'log_file':                   {'type': str},
+    'actions_log':                {'type': str},
+    'deductions_log':             {'type': str},
+    'process_scan_interval':      {'type': (int, float), 'min': 0.5, 'max': 60},
+    'scan_interval_min':          {'type': (int, float), 'min': 1},
+    'scan_interval_max':          {'type': (int, float), 'min': 1},
+    'baseline_min_samples':       {'type': int, 'min': 5},
+    'beacon_min_samples':         {'type': int, 'min': 5},
+    'risk_critical':              {'type': (int, float), 'min': 0, 'max': 1000},
+    'risk_warning':               {'type': (int, float), 'min': 0, 'max': 1000},
+    'entropy_suspicious_threshold': {'type': (int, float), 'min': 0, 'max': 8},
+    'exfil_bytes_spike_factor':   {'type': (int, float), 'min': 1},
+    'exfil_min_bytes':            {'type': int, 'min': 1000},
+    'dns_tunnel_max_label_len':   {'type': int, 'min': 10},
+    'dns_tunnel_entropy_threshold': {'type': (int, float), 'min': 0, 'max': 8},
+    'dns_tunnel_query_rate_threshold': {'type': (int, float), 'min': 1},
+    'geoip_cache_ttl':            {'type': (int, float), 'min': 0},
+    'geoip_enabled':              {'type': bool},
+    'high_risk_countries':        {'type': set, 'elem': str},
+    'user_idle_threshold':        {'type': (int, float), 'min': 0},
+    'registry_scan_interval':     {'type': (int, float), 'min': 5},
+    'dll_scan_interval':          {'type': (int, float), 'min': 5},
+    'escalation_window':          {'type': (int, float), 'min': 10},
+    'escalation_multiplier':      {'type': (int, float), 'min': 1.0, 'max': 10.0},
+    'siem_output':                {'type': (str, type(None)), 'choices': {None, 'json', 'cef', 'syslog'}},
+    'siem_host':                  {'type': str},
+    'siem_port':                  {'type': int, 'min': 1, 'max': 65535},
+    'dashboard_enabled':          {'type': bool},
+    'dashboard_port':             {'type': int, 'min': 1, 'max': 65535},
+    'ml_baseline_window':         {'type': (int, float), 'min': 60},
+    'ml_zscore_threshold':        {'type': (int, float), 'min': 1.0},
+    'config_file':                {'type': str},
+    'pipeline_workers':           {'type': int, 'min': 1, 'max': 16},
+    'pipeline_queue_size':        {'type': int, 'min': 100},
+}
+
+
+def validate_config(cfg: dict) -> list:
+    """Validate config dict against schema. Returns list of error strings (empty = valid)."""
+    errors = []
+    for key, rules in CONFIG_SCHEMA.items():
+        if key not in cfg:
+            continue
+        val = cfg[key]
+        expected_type = rules['type']
+        if not isinstance(val, expected_type):
+            errors.append(f"{key}: expected {expected_type}, got {type(val).__name__} ({val!r})")
+            continue
+        if 'elem' in rules and isinstance(val, set):
+            for item in val:
+                if not isinstance(item, rules['elem']):
+                    errors.append(f"{key}: set element {item!r} is not {rules['elem'].__name__}")
+                    break
+        if 'min' in rules and isinstance(val, (int, float)) and val < rules['min']:
+            errors.append(f"{key}: {val} < minimum {rules['min']}")
+        if 'max' in rules and isinstance(val, (int, float)) and val > rules['max']:
+            errors.append(f"{key}: {val} > maximum {rules['max']}")
+        if 'choices' in rules and val not in rules['choices']:
+            errors.append(f"{key}: {val!r} not in {rules['choices']}")
+    return errors
+
+
+def load_config(cfg_path: Optional[str] = None):
+    """Load config from YAML file, validate, and merge into CONFIG."""
+    try:
+        import yaml
+    except ImportError:
+        _mb_logger.info("PyYAML not installed — using default config")
+        return
+    cfg_file = cfg_path or CONFIG.get('config_file', 'medianbox_config.yaml')
+    if not os.path.exists(cfg_file):
+        _mb_logger.debug("Config file %s not found — using defaults", cfg_file)
+        return
+    try:
+        with open(cfg_file, encoding='utf-8') as f:
+            user_cfg = yaml.safe_load(f) or {}
+    except Exception as exc:
+        _mb_logger.warning("Failed to load config from %s: %s", cfg_file, exc)
+        return
+    for k, v in user_cfg.items():
+        if k in CONFIG and isinstance(CONFIG[k], set) and isinstance(v, list):
+            user_cfg[k] = set(v)
+    errors = validate_config(user_cfg)
+    if errors:
+        for err in errors:
+            _mb_logger.warning("Config validation error: %s", err)
+        _mb_logger.warning("Config file has %d error(s) — invalid keys were NOT applied", len(errors))
+        error_keys = {e.split(':')[0] for e in errors}
+        for k, v in user_cfg.items():
+            if k in CONFIG and k not in error_keys:
+                CONFIG[k] = v
+    else:
+        for k, v in user_cfg.items():
+            if k in CONFIG:
+                CONFIG[k] = v
+    _mb_logger.info("Loaded config from %s", cfg_file)
+
+
+# ========================== MODELS ==========================
+@dataclass
+class ProcessProfile:
+    pid: int
+    name: str
+    exe_path: str = ""
+    parent_pid: int = 0
+    parent_name: str = ""
+    start_time: float = 0.0
+    destinations: set[str] = field(default_factory=set)
+    dns_domains: set[str] = field(default_factory=set)
+    sni_domains: set[str] = field(default_factory=set)
+    connection_count: int = 0
+    cpu_samples: "deque[float]" = field(default_factory=lambda: deque(maxlen=60))
+    packet_timestamps: "deque[float]" = field(default_factory=lambda: deque(maxlen=500))
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    risk_score: float = 0.0
+    risk_reasons: list[str] = field(default_factory=list)
+    last_network_ts: float = 0.0
+    checked_legitimacy: bool = False
+    checked_dlls: bool = False
+    io_baseline_sent: int = 0
+    io_baseline_recv: int = 0
+    io_snapshot_time: float = 0.0
+    geo_countries: set[str] = field(default_factory=set)
+    loaded_dlls: list[str] = field(default_factory=list)
+    escalation_hits: int = 0
+    ml_anomaly_score: float = 0.0
+
+
+@dataclass
+class Deduction:
+    timestamp: float
+    severity: str
+    category: str
+    process_name: str
+    pid: int
+    message: str
+    evidence: list
+    score: float
+
+
+# ========================== OUI LOOKUP ==========================
+_FALLBACK_OUI = {
+    '001A2B': 'Apple', 'ACBC32': 'Samsung', '000C29': 'VMware', '001C42': 'D-Link',
+    'AC8995': 'TP-Link', '001E65': 'Netgear', 'B827EB': 'Raspberry Pi', 'F81A67': 'TP-Link',
+    '001122': 'Generic', '0024E4': 'Withings', '00156D': 'Ubiquiti', '001B11': 'ARRIS',
+    '00E04C': 'Realtek', '0017C4': 'Nokia', '0019E0': 'TP-Link', '0024A5': 'Freebox',
+    '001D92': 'AVM', '0026B9': 'Dell', '001310': 'HP', '001E0B': 'Hewlett-Packard',
+    'F0B429': 'Google Nest', '00163E': 'ASUSTek', '0024D2': 'Askey', '001B21': 'Intel',
+    '0014D1': 'OvisLink', '0019FB': 'Philips', '0023DF': 'Sony', '000E8F': 'ADT',
+    'F4F5D8': 'Google', '0017B0': 'Samsung', '0018F8': 'Linksys', '0023BE': 'Belkin',
+    '001D0F': 'TP-Link', '0024D7': 'Xiaomi', '0019E3': 'Aruba', '0026BB': 'ARRIS',
+}
+
+
+def get_vendor(mac: str) -> str:
+    if not mac:
+        return "Unknown"
+    if _HAS_MANUF:
+        try:
+            result = _PARSER.get_manuf(mac)
+            if result:
+                return result
+        except Exception as exc:
+            _mb_logger.debug("manuf lookup failed for %s: %s", mac, exc)
+    prefix = mac.upper().replace(':', '').replace('-', '')[:6]
+    return _FALLBACK_OUI.get(prefix, "Unknown Vendor")
+
+
+# ========================== DNS CACHE & TUNNEL DETECTOR ==========================
+class DNSCache:
+    """Thread-safe DNS resolution cache built from sniffed DNS responses."""
+    def __init__(self):
+        self.ip_to_domains: dict[str, set[str]] = defaultdict(set)
+        self.domain_to_ips: dict[str, set[str]] = defaultdict(set)
+        self.query_log: deque = deque(maxlen=5000)
+        self.lock = threading.Lock()
+
+    def process_packet(self, pkt):
+        if not pkt.haslayer(DNS):
+            return
+        dns_layer = pkt[DNS]
+        if dns_layer.qr == 1 and dns_layer.ancount and dns_layer.ancount > 0:
+            try:
+                qname = dns_layer.qd.qname.decode(errors='ignore').rstrip('.')
+                rr = dns_layer.an
+                for _ in range(min(dns_layer.ancount, 30)):
+                    if rr is None:
+                        break
+                    if hasattr(rr, 'rdata'):
+                        ip_str = str(rr.rdata)
+                        try:
+                            ipaddress.ip_address(ip_str)
+                            with self.lock:
+                                self.ip_to_domains[ip_str].add(qname)
+                                self.domain_to_ips[qname].add(ip_str)
+                        except ValueError:
+                            pass
+                    rr = rr.payload if hasattr(rr, 'payload') and rr.payload else None
+            except Exception as exc:
+                _mb_logger.debug("DNS response parse error: %s", exc)
+        elif dns_layer.qr == 0:
+            try:
+                qname = dns_layer.qd.qname.decode(errors='ignore').rstrip('.')
+                src = pkt[IP].src if pkt.haslayer(IP) else "?"
+                with self.lock:
+                    self.query_log.append((time.time(), src, qname))
+            except Exception as exc:
+                _mb_logger.debug("DNS query parse error: %s", exc)
+
+    def get_domains(self, ip: str) -> set[str]:
+        with self.lock:
+            return set(self.ip_to_domains.get(ip, set()))
+
+    def get_ips(self, domain: str) -> set[str]:
+        with self.lock:
+            return set(self.domain_to_ips.get(domain, set()))
+
+    def recent_queries(self, keyword: str, window: float = 120) -> list[tuple]:
+        cutoff = time.time() - window
+        with self.lock:
+            return [(t, s, d) for t, s, d in self.query_log
+                    if t > cutoff and keyword in d.lower()]
+
+
+class DNSTunnelingDetector:
+    """Detects data exfiltration via DNS queries (long subdomains, high entropy, high rate)."""
+    def __init__(self):
+        self.domain_query_counts: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def shannon_entropy(s: str) -> float:
+        if not s:
+            return 0.0
+        freq = Counter(s)
+        length = len(s)
+        return -sum((c / length) * math.log2(c / length) for c in freq.values())
+
+    def analyze_query(self, qname: str) -> tuple[bool, float, list[str]]:
+        evidence = []
+        score = 0.0
+        parts = qname.split('.')
+        if len(parts) < 2:
+            return False, 0, []
+        base_domain = '.'.join(parts[-2:])
+        subdomain = '.'.join(parts[:-2])
+        max_label = max((len(p) for p in parts[:-2]), default=0)
+        if max_label > CONFIG['dns_tunnel_max_label_len']:
+            evidence.append(f"Very long subdomain label: {max_label} chars")
+            score += 25
+        if subdomain:
+            ent = self.shannon_entropy(subdomain.replace('.', ''))
+            if ent > CONFIG['dns_tunnel_entropy_threshold']:
+                evidence.append(f"High subdomain entropy: {ent:.2f} bits")
+                score += 25
+        now = time.time()
+        with self.lock:
+            self.domain_query_counts[base_domain].append(now)
+            recent = sum(1 for t in self.domain_query_counts[base_domain] if now - t < 60)
+        if recent > CONFIG['dns_tunnel_query_rate_threshold']:
+            evidence.append(f"High query rate: {recent}/min to {base_domain}")
+            score += 25
+        if len(evidence) >= 2:
+            score += 15
+            evidence.append("Multiple indicators — high confidence DNS tunneling")
+        return score >= 25, score, evidence
+
+
+# ========================== NETWORK DETECTORS ==========================
+class BeaconDetector:
+    """Catches C2 beaconing via inter-packet timing regularity analysis."""
+    @staticmethod
+    def analyze(timestamps) -> tuple[bool, float, str]:
+        if len(timestamps) < CONFIG['beacon_min_samples']:
+            return False, 0.0, ""
+        ts = sorted(timestamps)
+        intervals = [ts[i+1] - ts[i] for i in range(len(ts)-1)]
+        if not intervals:
+            return False, 0.0, ""
+        mean_iv = statistics.mean(intervals)
+        if mean_iv < 0.5:
+            return False, 0.0, ""
+        try:
+            stdev_iv = statistics.stdev(intervals)
+            cv = stdev_iv / mean_iv if mean_iv > 0 else float('inf')
+        except statistics.StatisticsError:
+            return False, 0.0, ""
+        if cv < 0.12 and mean_iv > 2:
+            conf = min(1.0, (0.12 - cv) / 0.12 + 0.5)
+            return True, conf, f"Fixed beacon: {mean_iv:.1f}s +/-{stdev_iv:.2f}s jitter={cv:.3f}"
+        if cv < 0.25 and mean_iv > 5 and len(intervals) > 40:
+            conf = min(0.85, (0.25 - cv) / 0.25 + 0.3)
+            return True, conf, f"Periodic callback: ~{mean_iv:.1f}s jitter={cv:.3f}"
+        if len(intervals) > 30:
+            median_iv = statistics.median(intervals)
+            if median_iv > 3:
+                within = sum(1 for i in intervals if abs(i - median_iv) < median_iv * 0.15)
+                ratio = within / len(intervals)
+                if ratio > 0.65:
+                    return True, ratio * 0.75, f"Clustered: ~{median_iv:.1f}s {ratio:.0%} consistent"
+        return False, 0.0, ""
+
+
+class SNIExtractor:
+    """Extracts Server Name Indication from TLS ClientHello."""
+    @staticmethod
+    def extract(pkt) -> Optional[str]:
+        if not (pkt.haslayer(TCP) and pkt.haslayer(Raw)):
+            return None
+        try:
+            data = bytes(pkt[Raw])
+            if len(data) < 6 or data[0] != 0x16:
+                return None
+            hs_data = data[5:]
+            if len(hs_data) < 4 or hs_data[0] != 0x01:
+                return None
+            ch_len = int.from_bytes(hs_data[1:4], 'big')
+            ch = hs_data[4:4+ch_len]
+            if len(ch) < 38:
+                return None
+            offset = 34
+            sess_id_len = ch[offset]
+            offset += 1 + sess_id_len
+            if offset + 2 > len(ch):
+                return None
+            cipher_len = int.from_bytes(ch[offset:offset+2], 'big')
+            offset += 2 + cipher_len
+            if offset >= len(ch):
+                return None
+            comp_len = ch[offset]
+            offset += 1 + comp_len
+            if offset + 2 > len(ch):
+                return None
+            ext_total = int.from_bytes(ch[offset:offset+2], 'big')
+            offset += 2
+            end = min(offset + ext_total, len(ch))
+            while offset + 4 < end:
+                ext_type = int.from_bytes(ch[offset:offset+2], 'big')
+                ext_len = int.from_bytes(ch[offset+2:offset+4], 'big')
+                offset += 4
+                if ext_type == 0x0000:
+                    sni_data = ch[offset:offset+ext_len]
+                    if len(sni_data) >= 5:
+                        name_len = int.from_bytes(sni_data[3:5], 'big')
+                        if len(sni_data) >= 5 + name_len:
+                            return sni_data[5:5+name_len].decode('ascii', errors='ignore')
+                offset += ext_len
+        except Exception as exc:
+            _mb_logger.debug("SNI extraction error: %s", exc)
+        return None
+
+
+class EntropyAnalyzer:
+    """Shannon entropy analysis on packet payloads to detect encrypted C2."""
+    @staticmethod
+    def payload_entropy(data: bytes) -> float:
+        if not data:
+            return 0.0
+        freq = Counter(data)
+        length = len(data)
+        return -sum((c / length) * math.log2(c / length) for c in freq.values())
+
+    @staticmethod
+    def is_suspicious(pkt, entropy_val: float) -> tuple[bool, str]:
+        sport = pkt[TCP].sport if pkt.haslayer(TCP) else (pkt[UDP].sport if pkt.haslayer(UDP) else 0)
+        dport = pkt[TCP].dport if pkt.haslayer(TCP) else (pkt[UDP].dport if pkt.haslayer(UDP) else 0)
+        tls_ports = {443, 8443, 993, 995, 465, 636}
+        if dport in tls_ports or sport in tls_ports:
+            return False, ""
+        if entropy_val > CONFIG['entropy_suspicious_threshold']:
+            return True, (f"High entropy {entropy_val:.2f} on non-TLS port "
+                          f"(sport={sport} dport={dport}) — possible encrypted C2")
+        return False, ""
+
+
+# ========================== PROCESS DETECTORS ==========================
+class ProcessLegitimacyChecker:
+    """Detects impersonation by verifying exe path and parent chain."""
+    @staticmethod
+    def check_path(name: str, exe_path: str) -> tuple[bool, str]:
+        name_l = name.lower()
+        exe_l = (exe_path or "").lower()
+        if name_l in EXPECTED_EXE_PATHS and exe_l and not any(f in exe_l for f in EXPECTED_EXE_PATHS[name_l]):
+            return True, f"'{name}' at unexpected path: {exe_path}"
+        return False, ""
+
+    @staticmethod
+    def check_parent(name: str, parent_name: str) -> tuple[bool, str]:
+        name_l = name.lower()
+        parent_l = (parent_name or "").lower()
+        if name_l in EXPECTED_PARENTS:
+            expected = EXPECTED_PARENTS[name_l]
+            if parent_l and parent_l not in expected:
+                return True, f"'{name}' has unexpected parent '{parent_name}' (expected: {expected})"
+        return False, ""
+
+    @staticmethod
+    def check_all(proc) -> list[str]:
+        reasons = []
+        try:
+            name = proc.name()
+            exe = proc.exe() or ""
+            sus, msg = ProcessLegitimacyChecker.check_path(name, exe)
+            if sus:
+                reasons.append(msg)
+            try:
+                parent = psutil.Process(proc.ppid())
+                sus2, msg2 = ProcessLegitimacyChecker.check_parent(name, parent.name())
+                if sus2:
+                    reasons.append(msg2)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            if name.lower() in ("svchost.exe", "csrss.exe", "lsass.exe", "services.exe",
+                                "smss.exe", "winlogon.exe", "wininit.exe"):
+                if exe and "system32" not in exe.lower() and "syswow64" not in exe.lower():
+                    reasons.append(f"SYSTEM IMPERSONATION: '{name}' at '{exe}' — NOT in System32")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return reasons
+
+
+class DLLInspector:
+    """Checks loaded modules per process for suspicious DLL paths."""
+    @staticmethod
+    def inspect(proc) -> list[str]:
+        suspicious = []
+        if not _IS_WINDOWS:
+            return suspicious
+        try:
+            for mmap in proc.memory_maps(grouped=False):
+                path_lower = (mmap.path or "").lower()
+                if any(frag in path_lower for frag in SUSPICIOUS_DLL_PATHS):
+                    suspicious.append(mmap.path)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        except Exception as exc:
+            _mb_logger.debug("DLL inspection error for %s: %s", proc, exc)
+        return suspicious
+
+
+# ========================== SYSTEM DETECTORS ==========================
+class RegistryMonitor:
+    """Monitors Windows Run keys and scheduled tasks for persistence changes."""
+    def __init__(self):
+        self.baseline: dict[str, str] = {}
+        self.lock = threading.Lock()
+
+    def scan(self) -> list[tuple[str, str, str]]:
+        if not _IS_WINDOWS:
+            return []
+        changes = []
+        current = {}
+        for hive, key_path in PERSISTENCE_KEYS:
+            try:
+                with winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ) as key:
+                    i = 0
+                    while True:
+                        try:
+                            name, value, _ = winreg.EnumValue(key, i)
+                            full_key = f"{key_path}\\{name}"
+                            current[full_key] = str(value)
+                            i += 1
+                        except OSError:
+                            break
+            except OSError as exc:
+                _mb_logger.debug("Registry scan error for %s: %s", key_path, exc)
+        with self.lock:
+            if self.baseline:
+                for k, v in current.items():
+                    if k not in self.baseline:
+                        changes.append(("ADDED", k, v))
+                    elif self.baseline[k] != v:
+                        changes.append(("MODIFIED", k, v))
+                for k in self.baseline:
+                    if k not in current:
+                        changes.append(("REMOVED", k, self.baseline[k]))
+            self.baseline = current
+        return changes
+
+
+class UserIdleMonitor:
+    """Tracks user idle time via Windows GetLastInputInfo."""
+    @staticmethod
+    def get_idle_seconds() -> float:
+        if not _IS_WINDOWS:
+            return 0.0
+        try:
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+            lii = LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+                return millis / 1000.0
+        except Exception as exc:
+            _mb_logger.debug("GetLastInputInfo failed: %s", exc)
+        return 0.0
+
+
+# ========================== STATISTICAL BASELINE ==========================
+class StatisticalBaseline:
+    """Z-score anomaly detection per process name on key behavioral metrics."""
+    def __init__(self):
+        self.models: dict[str, dict] = defaultdict(lambda: {
+            'conn_rate': deque(maxlen=500),
+            'dst_count': deque(maxlen=500),
+            'bytes_rate': deque(maxlen=500),
+            'cpu_mean': deque(maxlen=500),
+        })
+        self.lock = threading.Lock()
+
+    def record(self, proc_name: str, conn_rate: float, dst_count: int,
+               bytes_rate: float, cpu_mean: float):
+        with self.lock:
+            m = self.models[proc_name]
+            m['conn_rate'].append(conn_rate)
+            m['dst_count'].append(dst_count)
+            m['bytes_rate'].append(bytes_rate)
+            m['cpu_mean'].append(cpu_mean)
+
+    def score(self, proc_name: str, conn_rate: float, dst_count: int,
+              bytes_rate: float, cpu_mean: float) -> tuple[float, list[str]]:
+        anomalies = []
+        total_z = 0.0
+        with self.lock:
+            m = self.models.get(proc_name)
+            if not m or len(m['conn_rate']) < 30:
+                return 0.0, []
+            for metric_name, current_val in [('conn_rate', conn_rate), ('dst_count', dst_count),
+                                              ('bytes_rate', bytes_rate), ('cpu_mean', cpu_mean)]:
+                samples = list(m[metric_name])
+                if len(samples) < 10:
+                    continue
+                mean = statistics.mean(samples)
+                try:
+                    std = statistics.stdev(samples)
+                except statistics.StatisticsError:
+                    continue
+                if std < 0.001:
+                    continue
+                z = abs(current_val - mean) / std
+                if z > CONFIG['ml_zscore_threshold']:
+                    anomalies.append(f"{metric_name}: z={z:.1f} (val={current_val:.1f} mean={mean:.1f} std={std:.1f})")
+                    total_z += z
+        score = min(100, total_z * 10)
+        return score, anomalies
+
+
+# ========================== JA4+ FINGERPRINTING ==========================
+class JA4Plus:
+    """Extended JA4 — JA4S (ServerHello), JA4H (HTTP), JA4X (X.509 cert)."""
+    @staticmethod
+    def ja4(pkt) -> Optional[str]:
+        if not (pkt.haslayer(TCP) and pkt.haslayer(Raw)):
+            return None
+        try:
+            data = bytes(pkt[Raw])
+            if len(data) < 9 or data[0] != 0x16:
+                return None
+            handshake = data[5:]
+            if len(handshake) < 4 or handshake[0] != 0x01:
+                return None
+            ch = handshake[4:]
+            if len(ch) < 38:
+                return None
+            tls_ver = f"t{ch[0]:02x}{ch[1]:02x}"
+            sess_id_len = ch[34]
+            offset = 35 + sess_id_len
+            cipher_len = int.from_bytes(ch[offset:offset+2], 'big')
+            offset += 2 + cipher_len
+            comp_len = ch[offset]
+            offset += 1 + comp_len
+            ext_len = int.from_bytes(ch[offset:offset+2], 'big')
+            alpn = "h2" if b'\x00\x10' in data else "http1"
+            return f"{tls_ver}d{cipher_len//2:02d}{ext_len//4:02d}_{alpn}"
+        except Exception as exc:
+            _mb_logger.debug("JA4 fingerprint error: %s", exc)
+            return None
+
+    @staticmethod
+    def ja4s(pkt) -> Optional[str]:
+        if not (pkt.haslayer(TCP) and pkt.haslayer(Raw)):
+            return None
+        try:
+            data = bytes(pkt[Raw])
+            if len(data) < 6 or data[0] != 0x16:
+                return None
+            hs = data[5:]
+            if len(hs) < 4 or hs[0] != 0x02:
+                return None
+            sh = hs[4:]
+            if len(sh) < 38:
+                return None
+            ver = f"s{sh[0]:02x}{sh[1]:02x}"
+            cipher = int.from_bytes(sh[35:37], 'big')
+            return f"{ver}c{cipher:04x}"
+        except Exception as exc:
+            _mb_logger.debug("JA4S parse error: %s", exc)
+            return None
+
+    @staticmethod
+    def ja4h(pkt) -> Optional[str]:
+        if not pkt.haslayer(Raw):
+            return None
+        try:
+            data = bytes(pkt[Raw])
+            text = data.decode('ascii', errors='ignore')
+            if not any(text.startswith(m) for m in ['GET ', 'POST ', 'PUT ', 'DELETE ', 'PATCH ', 'HEAD ']):
+                return None
+            lines = text.split('\r\n')
+            method = lines[0].split(' ')[0]
+            headers = []
+            for line in lines[1:]:
+                if ':' in line:
+                    headers.append(line.split(':')[0].strip().lower())
+                elif line == '':
+                    break
+            h_hash = hashlib.sha256(','.join(headers).encode()).hexdigest()[:12]
+            return f"h_{method}_{len(headers):02d}_{h_hash}"
+        except Exception as exc:
+            _mb_logger.debug("JA4H parse error: %s", exc)
+            return None
+
+    @staticmethod
+    def ja4x(cert_data: bytes) -> Optional[str]:
+        try:
+            h = hashlib.sha256(cert_data).hexdigest()[:16]
+            return f"x_{h}"
+        except Exception as exc:
+            _mb_logger.debug("JA4X hash error: %s", exc)
+            return None
+
+
+# ========================== GEOIP WITH RATE LIMITER ==========================
+class TokenBucket:
+    """Thread-safe token bucket rate limiter. ip-api.com free tier: 45 req/min."""
+    def __init__(self, rate: float = 40.0, capacity: float = 45.0):
+        self.rate = rate / 60.0
+        self.capacity = capacity
+        self.tokens = capacity
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self, tokens: float = 1.0) -> bool:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self._last_refill = now
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            return False
+
+
+class GeoIPCache:
+    """Thread-safe GeoIP lookup with caching, rate limiting, optional local DB, and HTTPS fallback."""
+    _PRIVACY_WARNED = False
+    _EMPTY: dict[str, object] = {'country': '??', 'countryCode': '??', 'city': '??',
+                                 'org': 'Unknown', 'isp': 'Unknown', 'lat': 0, 'lon': 0}
+
+    def __init__(self, maxmind_db_path: Optional[str] = None):
+        self.cache: dict[str, dict] = {}
+        self.lock = threading.Lock()
+        self._api_url = ("https://ip-api.com/json/{ip}?fields="
+                        "status,country,countryCode,org,as,isp,lat,lon,city,regionName,timezone")
+        self._rate_limiter = TokenBucket(rate=40.0, capacity=45.0)
+        self._rate_limited_count = 0
+        self._local_reader = None
+        db_path = maxmind_db_path or CONFIG.get('geoip_db_path')
+        if db_path and HAS_GEOIP2:
+            try:
+                self._local_reader = _geoip2_db.Reader(db_path)
+                _mb_logger.info("GeoIP: using local MaxMind DB at %s", db_path)
+            except Exception as exc:
+                _mb_logger.warning("GeoIP: failed to open MaxMind DB '%s': %s — falling back to API", db_path, exc)
+
+    def _lookup_local(self, ip: str) -> Optional[dict]:
+        if not self._local_reader:
+            return None
+        try:
+            resp = self._local_reader.city(ip)
+            return {
+                'status': 'success',
+                'country': resp.country.name or '??',
+                'countryCode': resp.country.iso_code or '??',
+                'city': resp.city.name or '??',
+                'regionName': (resp.subdivisions.most_specific.name
+                               if resp.subdivisions else ''),
+                'org': (resp.traits.organization or
+                        resp.traits.autonomous_system_organization or 'Unknown'),
+                'isp': resp.traits.isp if hasattr(resp.traits, 'isp') else 'Unknown',
+                'as': (f"AS{resp.traits.autonomous_system_number}"
+                       if resp.traits.autonomous_system_number else ''),
+                'lat': resp.location.latitude or 0.0,
+                'lon': resp.location.longitude or 0.0,
+                'timezone': resp.location.time_zone or '',
+                '_ts': time.time(),
+                '_source': 'local',
+            }
+        except Exception as exc:
+            _mb_logger.debug("Local GeoIP lookup failed for %s: %s", ip, exc)
+            return None
+
+    def _lookup_api(self, ip: str) -> Optional[dict]:
+        if not self._rate_limiter.consume():
+            self._rate_limited_count += 1
+            if self._rate_limited_count % 50 == 1:
+                _mb_logger.warning("GeoIP rate limited — %d lookups throttled. "
+                                "Consider using a local MaxMind DB (geoip_db_path config).",
+                                self._rate_limited_count)
+            return None
+        try:
+            url = self._api_url.format(ip=ip)
+            req = urllib.request.Request(url, headers={'User-Agent': 'MedianBoxMonitor/3.0'})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get('status') == 'success':
+                data['_ts'] = time.time()
+                data['_source'] = 'api'
+                return data
+        except Exception as exc:
+            _mb_logger.debug("GeoIP API lookup failed for %s: %s", ip, exc)
+        return None
+
+    def lookup(self, ip: str) -> Optional[dict]:
+        if not CONFIG.get('geoip_enabled', True):
+            return None
+        if not GeoIPCache._PRIVACY_WARNED and not self._local_reader:
+            _mb_logger.warning(
+                "GeoIP enabled: destination IPs will be sent to ip-api.com over HTTPS. "
+                "Set geoip_enabled=False or configure geoip_db_path for local lookups."
+            )
+            GeoIPCache._PRIVACY_WARNED = True
+        with self.lock:
+            cached = self.cache.get(ip)
+            if cached and time.time() - cached.get('_ts', 0) < CONFIG['geoip_cache_ttl']:
+                return cached
+        data = self._lookup_local(ip) or self._lookup_api(ip)
+        if data:
+            with self.lock:
+                self.cache[ip] = data
+            return data
+        return None
+
+    def get_country(self, ip: str) -> str:
+        info = self.lookup(ip)
+        return info.get('countryCode', '??') if info else '??'
+
+    def get_org(self, ip: str) -> str:
+        info = self.lookup(ip)
+        return info.get('org', 'Unknown') if info else 'Unknown'
+
+    def get_coords(self, ip: str) -> tuple:
+        info = self.lookup(ip)
+        if info:
+            return info.get('lat', 0.0), info.get('lon', 0.0)
+        return 0.0, 0.0
+
+    def get_full(self, ip: str) -> dict:
+        info = self.lookup(ip)
+        if not info:
+            return dict(self._EMPTY)
+        return info
+
+
+# ========================== LOGGING SETUP ==========================
+def setup_structured_logging():
+    """Configure Python logging with rotation for main, actions, and deductions logs."""
+    logger = logging.getLogger('medianbox')
+    if not logger.handlers:
+        logger.setLevel(logging.DEBUG)
+        fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        fh = RotatingFileHandler('medianbox_structured.log', maxBytes=50_000_000, backupCount=5,
+                                 encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    actions_logger = logging.getLogger('medianbox.actions')
+    if not actions_logger.handlers:
+        actions_logger.setLevel(logging.DEBUG)
+        actions_logger.propagate = False
+        afmt = logging.Formatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        afh = RotatingFileHandler(CONFIG['actions_log'], maxBytes=50_000_000, backupCount=3,
+                                  encoding='utf-8')
+        afh.setLevel(logging.DEBUG)
+        afh.setFormatter(afmt)
+        actions_logger.addHandler(afh)
+
+    ded_logger = logging.getLogger('medianbox.deductions')
+    if not ded_logger.handlers:
+        ded_logger.setLevel(logging.DEBUG)
+        ded_logger.propagate = False
+        dfmt = logging.Formatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        dfh = RotatingFileHandler(CONFIG['deductions_log'], maxBytes=50_000_000, backupCount=3,
+                                  encoding='utf-8')
+        dfh.setLevel(logging.DEBUG)
+        dfh.setFormatter(dfmt)
+        ded_logger.addHandler(dfh)
+
+    return logger
+
+
+# ========================== SIEM OUTPUT ==========================
+class SIEMOutput:
+    """Formats and sends deductions as CEF, JSON, or Syslog."""
+    def __init__(self):
+        self.sock = None
+        self._json_logger = None
+        self._cef_logger = None
+        if CONFIG['siem_output'] == 'json':
+            self._json_logger = self._make_file_logger('medianbox.siem_json', 'medianbox_siem.json')
+        elif CONFIG['siem_output'] == 'cef':
+            self._cef_logger = self._make_file_logger('medianbox.siem_cef', 'medianbox_siem.cef')
+        elif CONFIG['siem_output'] == 'syslog':
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            except Exception as exc:
+                _mb_logger.warning("Failed to create syslog socket: %s", exc)
+
+    @staticmethod
+    def _make_file_logger(name: str, filename: str):
+        lg = logging.getLogger(name)
+        if not lg.handlers:
+            lg.setLevel(logging.DEBUG)
+            lg.propagate = False
+            fh = RotatingFileHandler(filename, maxBytes=50_000_000, backupCount=3, encoding='utf-8')
+            fh.setFormatter(logging.Formatter('%(message)s'))
+            lg.addHandler(fh)
+        return lg
+
+    def emit(self, d: Deduction):
+        fmt = CONFIG.get('siem_output')
+        if not fmt:
+            return
+        if fmt == 'json':
+            self._emit_json(d)
+        elif fmt == 'cef':
+            self._emit_cef(d)
+        elif fmt == 'syslog':
+            self._emit_syslog(d)
+
+    def _emit_json(self, d: Deduction):
+        record = {
+            'timestamp': datetime.datetime.fromtimestamp(d.timestamp).isoformat(),
+            'severity': d.severity, 'category': d.category,
+            'process': d.process_name, 'pid': d.pid,
+            'message': d.message, 'evidence': d.evidence, 'score': d.score,
+        }
+        if self._json_logger:
+            self._json_logger.info(json.dumps(record))
+
+    def _emit_cef(self, d: Deduction):
+        sev_map = {'INFO': 3, 'WARNING': 6, 'CRITICAL': 9}
+        sev = sev_map.get(d.severity, 5)
+        cef = (f"CEF:0|MedianBox|ChessEngine|3.0|{d.category}|{d.message[:128]}|{sev}|"
+               f"src={d.process_name} pid={d.pid} score={d.score:.1f}")
+        if self._cef_logger:
+            self._cef_logger.info(cef)
+
+    def _emit_syslog(self, d: Deduction):
+        if not self.sock:
+            return
+        pri = 134
+        if d.severity == 'CRITICAL':
+            pri = 130
+        elif d.severity == 'WARNING':
+            pri = 132
+        msg = f"<{pri}>MedianBox: [{d.category}] {d.message} pid={d.pid} score={d.score:.1f}"
+        try:
+            self.sock.sendto(msg.encode()[:1024],
+                             (CONFIG['siem_host'], CONFIG['siem_port']))
+        except Exception as exc:
+            _mb_logger.debug("SIEM syslog send failed: %s", exc)
+
+
+# ========================== ALERT ESCALATION ==========================
+class AlertEscalation:
+    """Compounds risk when same process triggers multiple deductions in a window."""
+    def __init__(self):
+        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=50))
+        self.lock = threading.Lock()
+
+    def record(self, pid: int, score: float):
+        with self.lock:
+            self.history[pid].append((time.time(), score))
+
+    def get_multiplier(self, pid: int) -> float:
+        cutoff = time.time() - CONFIG['escalation_window']
+        with self.lock:
+            recent = [(t, s) for t, s in self.history.get(pid, []) if t > cutoff]
+        if len(recent) <= 1:
+            return 1.0
+        return min(5.0, CONFIG['escalation_multiplier'] ** (len(recent) - 1))
+
+
+# ========================== DATABASE ==========================
+class DatabaseManager:
+    """Thread-safe SQLite with connection-per-operation and WAL journal mode."""
+    def __init__(self, db_path: Optional[str] = None):
+        self._db_path = db_path or CONFIG['db_file']
+        self._init_db()
+
+    def _get_db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self):
+        try:
+            conn = self._get_db()
+            conn.execute("""CREATE TABLE IF NOT EXISTS deductions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, severity TEXT, category TEXT,
+                process TEXT, pid INTEGER, message TEXT,
+                evidence TEXT, score REAL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS devices (
+                key TEXT PRIMARY KEY, mac TEXT, ip TEXT, vendor TEXT,
+                hostname TEXT, os_guess TEXT, first_seen TEXT,
+                last_seen TEXT, confidence REAL)""")
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            _mb_logger.warning("Database init failed: %s", exc)
+
+    def save_deduction(self, d: Deduction):
+        try:
+            conn = self._get_db()
+            conn.execute(
+                "INSERT INTO deductions (timestamp, severity, category, process, pid, message, evidence, score) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.datetime.fromtimestamp(d.timestamp).isoformat(),
+                 d.severity, d.category, d.process_name, d.pid,
+                 d.message, json.dumps(d.evidence), d.score))
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            _mb_logger.debug("DB deduction save failed: %s", exc)
+
+    def save_device(self, key: str, dev: dict):
+        try:
+            conn = self._get_db()
+            conn.execute(
+                "INSERT OR REPLACE INTO devices (key, mac, ip, vendor, hostname, os_guess, "
+                "first_seen, last_seen, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (key, dev.get('mac'), dev.get('ip'), dev.get('vendor'),
+                 dev.get('hostname'), dev.get('os_guess'),
+                 datetime.datetime.fromtimestamp(dev.get('first_seen', 0)).isoformat(),
+                 datetime.datetime.fromtimestamp(dev.get('last_seen', 0)).isoformat(),
+                 dev.get('confidence', 0)))
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            _mb_logger.debug("DB device save failed: %s", exc)
+
+
+# ========================== PACKET PIPELINE ==========================
+class PacketPipeline:
+    """Multi-worker queue that decouples packet capture from analysis."""
+    def __init__(self, handler: Callable, stop_event: threading.Event,
+                 num_workers: Optional[int] = None, max_queue: Optional[int] = None):
+        self._handler = handler
+        self._stop = stop_event
+        self._num_workers = num_workers or CONFIG.get('pipeline_workers', 2)
+        self._queue: queue.Queue = queue.Queue(
+            maxsize=max_queue or CONFIG.get('pipeline_queue_size', 5000))
+        self._workers: list = []
+        self._dropped = 0
+        self._processed = 0
+        self._lock = threading.Lock()
+
+    def enqueue(self, pkt):
+        try:
+            self._queue.put_nowait(pkt)
+        except queue.Full:
+            with self._lock:
+                self._dropped += 1
+            if self._dropped % 500 == 1:
+                _mb_logger.warning("Packet pipeline full — dropped %d packets so far", self._dropped)
+
+    def _worker(self, worker_id: int):
+        _mb_logger.debug("Pipeline worker %d started", worker_id)
+        while not self._stop.is_set():
+            try:
+                pkt = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._handler(pkt)
+                with self._lock:
+                    self._processed += 1
+            except Exception as exc:
+                _mb_logger.debug("Pipeline worker %d error: %s", worker_id, exc)
+            finally:
+                self._queue.task_done()
+        _mb_logger.debug("Pipeline worker %d stopped", worker_id)
+
+    def start(self):
+        for i in range(self._num_workers):
+            t = threading.Thread(target=self._worker, args=(i,),
+                                 daemon=True, name=f"Pipeline-Worker-{i}")
+            t.start()
+            self._workers.append(t)
+        _mb_logger.info("Packet pipeline started with %d workers (queue=%d)",
+                     self._num_workers, self._queue.maxsize)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                'queue_size': self._queue.qsize(),
+                'processed': self._processed,
+                'dropped': self._dropped,
+                'workers': len(self._workers),
+            }
+
+    def drain(self, timeout: float = 5.0):
+        with contextlib.suppress(Exception):
+            self._queue.join()
+
+
+# ========================== SERVICE RESOLVER ==========================
+SERVICE_PATTERNS = [
+    (r'youtube|googlevideo|ytimg|yt\d', 'YouTube', 'Streaming', '🎬'),
+    (r'netflix|nflxvideo|nflximg|nflxso|nflxext', 'Netflix', 'Streaming', '🎬'),
+    (r'disneyplus|disney-plus|bamgrid|dssott', 'Disney+', 'Streaming', '🎬'),
+    (r'hulu|hulustream', 'Hulu', 'Streaming', '🎬'),
+    (r'primevideo|atv-ps|aiv-cdn|amazonvideo', 'Prime Video', 'Streaming', '🎬'),
+    (r'twitch\.tv|twitchcdn|jtvnw', 'Twitch', 'Streaming', '🎬'),
+    (r'crunchyroll|vrv\.co', 'Crunchyroll', 'Streaming', '🎬'),
+    (r'spotify|scdn\.co|audio-ak', 'Spotify', 'Streaming', '🎵'),
+    (r'tidal\.com|tidalhifi', 'Tidal', 'Streaming', '🎵'),
+    (r'facebook|fbcdn|fb\.com|fbsbx|instagram|cdninstagram', 'Meta (FB/IG)', 'Social', '📱'),
+    (r'twitter\.com|twimg|x\.com|abs\.twimg', 'X (Twitter)', 'Social', '📱'),
+    (r'reddit\.com|redd\.it|redditstatic|redditmedia', 'Reddit', 'Social', '📱'),
+    (r'tiktok|tiktokcdn|musical\.ly|byteoversea|byteimg', 'TikTok', 'Social', '📱'),
+    (r'snapchat|sc-cdn|snap-storage', 'Snapchat', 'Social', '📱'),
+    (r'linkedin\.com|licdn\.com', 'LinkedIn', 'Social', '📱'),
+    (r'pinterest\.com|pinimg\.com', 'Pinterest', 'Social', '📱'),
+    (r'discord|discordapp|dis\.gd', 'Discord', 'Communication', '💬'),
+    (r'slack\.com|slack-edge|slack-msgs', 'Slack', 'Communication', '💬'),
+    (r'teams\.microsoft|teams\.live|teams\.cdn', 'Microsoft Teams', 'Communication', '💬'),
+    (r'zoom\.us|zoom\.com|zoomgov', 'Zoom', 'Communication', '💬'),
+    (r'whatsapp|wa\.me', 'WhatsApp', 'Communication', '💬'),
+    (r'signal\.org|signal-cdn', 'Signal', 'Communication', '💬'),
+    (r'telegram\.org|t\.me|telegram-cdn', 'Telegram', 'Communication', '💬'),
+    (r'google\.com|googleapis|gstatic|goog\b|google-analytics|googleusercontent', 'Google', 'Tech', '🔍'),
+    (r'bing\.com|bingapis|msn\.com', 'Microsoft Bing', 'Tech', '🔍'),
+    (r'duckduckgo', 'DuckDuckGo', 'Tech', '🔍'),
+    (r'cloudflare|cf-|one\.one\.one', 'Cloudflare', 'CDN/Cloud', '☁️'),
+    (r'akamai|akam|akamaized|edgekey|edgesuite', 'Akamai CDN', 'CDN/Cloud', '☁️'),
+    (r'fastly|fastlylb', 'Fastly CDN', 'CDN/Cloud', '☁️'),
+    (r'amazonaws\.com|aws\.amazon|cloudfront\.net|s3\.', 'Amazon AWS', 'CDN/Cloud', '☁️'),
+    (r'azure\.com|azure\.net|msedge\.net|windows\.net', 'Microsoft Azure', 'CDN/Cloud', '☁️'),
+    (r'cloud\.google\.com|googleapis|gcp', 'Google Cloud', 'CDN/Cloud', '☁️'),
+    (r'amazon\.com|amazon\.co|media-amazon|images-amazon', 'Amazon', 'Shopping', '🛒'),
+    (r'ebay\.com|ebaystatic|ebayimg', 'eBay', 'Shopping', '🛒'),
+    (r'walmart\.com|walmartimages', 'Walmart', 'Shopping', '🛒'),
+    (r'shopify\.com|cdn\.shopify', 'Shopify', 'Shopping', '🛒'),
+    (r'riotgames|leagueoflegends|riotcdn', 'Riot Games', 'Gaming', '🎮'),
+    (r'steampowered|steamcommunity|steamcdn|valve\.net', 'Steam', 'Gaming', '🎮'),
+    (r'epicgames|fortnite|unrealengine', 'Epic Games', 'Gaming', '🎮'),
+    (r'battle\.net|blizzard|bnet', 'Blizzard', 'Gaming', '🎮'),
+    (r'xbox\.com|xboxlive', 'Xbox Live', 'Gaming', '🎮'),
+    (r'playstation|psn|sie\.com', 'PlayStation', 'Gaming', '🎮'),
+    (r'ea\.com|origin\.com|eaplay', 'EA Games', 'Gaming', '🎮'),
+    (r'microsoft\.com|microsoftonline|office365|office\.com|live\.com|outlook\.com|windows\.com|windowsupdate|msauth|login\.live', 'Microsoft', 'Tech', '🪟'),
+    (r'apple\.com|icloud|apple-dns|mzstatic|itunes', 'Apple', 'Tech', '🍎'),
+    (r'openai\.com|chatgpt|oaiusercontent', 'OpenAI', 'AI', '🤖'),
+    (r'anthropic\.com|claude\.ai', 'Anthropic', 'AI', '🤖'),
+    (r'gemini\.google|bard\.google|generativelanguage', 'Google Gemini', 'AI', '🤖'),
+    (r'grok|x\.ai', 'xAI Grok', 'AI', '🤖'),
+    (r'cnn\.com', 'CNN', 'News', '📰'),
+    (r'bbc\.co|bbc\.com', 'BBC', 'News', '📰'),
+    (r'nytimes\.com', 'NY Times', 'News', '📰'),
+    (r'foxnews\.com', 'Fox News', 'News', '📰'),
+    (r'gmail\.com|mail\.google', 'Gmail', 'Email', '📧'),
+    (r'outlook\.live|hotmail', 'Outlook', 'Email', '📧'),
+    (r'yahoo\.com|yimg\.com|yahoodns', 'Yahoo', 'Email/Web', '📧'),
+    (r'1\.1\.1\.1|one\.one', 'Cloudflare DNS', 'DNS', '🌐'),
+    (r'8\.8\.8\.8|8\.8\.4\.4|dns\.google', 'Google DNS', 'DNS', '🌐'),
+    (r'9\.9\.9\.9|dns\.quad9', 'Quad9 DNS', 'DNS', '🌐'),
+    (r'nordvpn|nord-vpn', 'NordVPN', 'VPN', '🔒'),
+    (r'expressvpn|xvpn', 'ExpressVPN', 'VPN', '🔒'),
+    (r'protonvpn|proton\.me', 'ProtonVPN', 'VPN', '🔒'),
+    (r'coinbase\.com', 'Coinbase', 'Crypto', '💰'),
+    (r'binance\.com', 'Binance', 'Crypto', '💰'),
+    (r'chase\.com', 'Chase Bank', 'Banking', '🏦'),
+    (r'bankofamerica|bofa\.com', 'Bank of America', 'Banking', '🏦'),
+    (r'paypal\.com|paypalobjects', 'PayPal', 'Finance', '💳'),
+    (r'venmo\.com', 'Venmo', 'Finance', '💳'),
+    (r'stripe\.com', 'Stripe', 'Finance', '💳'),
+    (r'github\.com|github\.io|githubusercontent', 'GitHub', 'Dev', '💻'),
+    (r'stackoverflow\.com|stackexchange', 'StackOverflow', 'Dev', '💻'),
+]
+
+_COMPILED_PATTERNS = [(re.compile(pat, re.IGNORECASE), name, cat, icon)
+                      for pat, name, cat, icon in SERVICE_PATTERNS]
+
+
+class ServiceResolver:
+    """Resolves IPs and domains to human-readable service names with caching."""
+    def __init__(self):
+        self._rdns_cache: dict[str, str] = {}
+        self._service_cache: dict[str, dict] = {}
+        self.lock = threading.Lock()
+
+    def resolve_domain(self, domain: str) -> dict:
+        if not domain:
+            return {'service': 'Unknown', 'category': 'Unknown', 'icon': '❓'}
+        domain_lower = domain.lower()
+        for pattern, name, category, icon in _COMPILED_PATTERNS:
+            if pattern.search(domain_lower):
+                return {'service': name, 'category': category, 'icon': icon}
+        return {'service': domain_lower, 'category': 'Other', 'icon': '🌐'}
+
+    def reverse_dns(self, ip: str) -> Optional[str]:
+        with self.lock:
+            if ip in self._rdns_cache:
+                return self._rdns_cache[ip]
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+            with self.lock:
+                self._rdns_cache[ip] = hostname
+            return hostname
+        except (socket.herror, socket.gaierror, OSError):
+            with self.lock:
+                self._rdns_cache[ip] = ""
+            return ""
+
+    def identify(self, ip: str, domains: Optional[set] = None) -> dict:
+        with self.lock:
+            cached = self._service_cache.get(ip)
+            if cached:
+                return cached
+        if domains:
+            for d in domains:
+                result = self.resolve_domain(d)
+                if result['service'] != d.lower():
+                    result['domain'] = d
+                    with self.lock:
+                        self._service_cache[ip] = result
+                    return result
+            first_domain = next(iter(domains))
+            result = {'service': first_domain, 'category': 'Other', 'icon': '🌐',
+                      'domain': first_domain}
+            with self.lock:
+                self._service_cache[ip] = result
+            return result
+        rdns = self.reverse_dns(ip)
+        if rdns:
+            result = self.resolve_domain(rdns)
+            result['domain'] = rdns
+            with self.lock:
+                self._service_cache[ip] = result
+            return result
+        if ip == '1.1.1.1' or ip == '1.0.0.1':
+            result = {'service': 'Cloudflare DNS', 'category': 'DNS', 'icon': '🌐', 'domain': ip}
+        elif ip.startswith('8.8.'):
+            result = {'service': 'Google DNS', 'category': 'DNS', 'icon': '🌐', 'domain': ip}
+        elif ip == '9.9.9.9':
+            result = {'service': 'Quad9 DNS', 'category': 'DNS', 'icon': '🌐', 'domain': ip}
+        else:
+            result = {'service': ip, 'category': 'Unknown', 'icon': '❓', 'domain': ip}
+        with self.lock:
+            self._service_cache[ip] = result
+        return result
+
+
+# ========================== CONNECTION INVENTORY ==========================
+class ConnectionEntry:
+    """Single tracked connection with full metadata."""
+    __slots__ = (
+        'category', 'city', 'country', 'country_code', 'domain',
+        'first_seen', 'icon', 'isp', 'last_seen', 'lat', 'local_port',
+        'lon', 'org', 'pid', 'process_name', 'protocol', 'region',
+        'remote_ip', 'remote_port', 'service', 'status',
+    )
+
+    def __init__(self):
+        self.pid = 0
+        self.process_name = ''
+        self.remote_ip = ''
+        self.remote_port = 0
+        self.local_port = 0
+        self.protocol = 'TCP'
+        self.status = ''
+        self.service = 'Unknown'
+        self.category = 'Unknown'
+        self.icon = '❓'
+        self.domain = ''
+        self.country = '??'
+        self.country_code = '??'
+        self.city = '??'
+        self.region = ''
+        self.org = 'Unknown'
+        self.isp = 'Unknown'
+        self.lat = 0.0
+        self.lon = 0.0
+        self.first_seen = 0.0
+        self.last_seen = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            'pid': self.pid, 'process': self.process_name,
+            'remote_ip': self.remote_ip, 'remote_port': self.remote_port,
+            'local_port': self.local_port, 'protocol': self.protocol,
+            'status': self.status, 'service': self.service,
+            'category': self.category, 'icon': self.icon, 'domain': self.domain,
+            'country': self.country, 'country_code': self.country_code,
+            'city': self.city, 'region': self.region,
+            'org': self.org, 'isp': self.isp,
+            'lat': self.lat, 'lon': self.lon,
+            'first_seen': self.first_seen, 'last_seen': self.last_seen,
+        }
+
+
+class ConnectionInventory:
+    """Maintains a live inventory of ALL network connections with service + geo data."""
+    def __init__(self, dns_cache: DNSCache, geoip: GeoIPCache,
+                 service_resolver: ServiceResolver, stop_event: threading.Event,
+                 conn_provider=None):
+        self.dns_cache = dns_cache
+        self.geoip = geoip
+        self.resolver = service_resolver
+        self.stop = stop_event
+        self._conn_provider = conn_provider
+        self.lock = threading.Lock()
+        self.connections: dict[tuple, ConnectionEntry] = {}
+        self.services_seen: dict[str, dict] = {}
+        self.total_unique_ips: set[str] = set()
+        self.scan_count = 0
+
+    def _is_public(self, ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip).is_global
+        except Exception:
+            return False
+
+    def _get_connections(self) -> list:
+        if self._conn_provider:
+            return self._conn_provider()
+        try:
+            return psutil.net_connections(kind='inet')
+        except psutil.AccessDenied:
+            _mb_logger.debug("Connection inventory: access denied for net_connections")
+            return []
+        except Exception as exc:
+            _mb_logger.debug("Connection inventory scan error: %s", exc)
+            return []
+
+    def scan(self):
+        now = time.time()
+        active_keys = set()
+        pid_names = {}
+        for proc in psutil.process_iter(['pid', 'name']):
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                pid_names[proc.pid] = proc.name()
+        conns = self._get_connections()
+        for conn in conns:
+            if not conn.raddr:
+                continue
+            remote_ip = conn.raddr[0]
+            remote_port = conn.raddr[1]
+            pid = conn.pid or 0
+            key = (remote_ip, remote_port, pid)
+            active_keys.add(key)
+            with self.lock:
+                if key in self.connections:
+                    self.connections[key].last_seen = now
+                    self.connections[key].status = conn.status
+                    continue
+            entry = ConnectionEntry()
+            entry.pid = pid
+            entry.process_name = pid_names.get(pid, f'PID:{pid}')
+            entry.remote_ip = remote_ip
+            entry.remote_port = remote_port
+            entry.local_port = conn.laddr[1] if conn.laddr else 0
+            entry.protocol = 'TCP' if conn.type == 1 else 'UDP'
+            entry.status = conn.status
+            entry.first_seen = now
+            entry.last_seen = now
+            domains = self.dns_cache.get_domains(remote_ip)
+            svc_info = self.resolver.identify(remote_ip, domains)
+            entry.service = svc_info.get('service', 'Unknown')
+            entry.category = svc_info.get('category', 'Unknown')
+            entry.icon = svc_info.get('icon', '❓')
+            entry.domain = svc_info.get('domain', '')
+            if self._is_public(remote_ip):
+                geo = self.geoip.get_full(remote_ip)
+                entry.country = geo.get('country', '??')
+                entry.country_code = geo.get('countryCode', '??')
+                entry.city = geo.get('city', '??')
+                entry.region = geo.get('regionName', '')
+                entry.org = geo.get('org', 'Unknown')
+                entry.isp = geo.get('isp', 'Unknown')
+                entry.lat = geo.get('lat', 0.0)
+                entry.lon = geo.get('lon', 0.0)
+                self.total_unique_ips.add(remote_ip)
+            with self.lock:
+                self.connections[key] = entry
+                self.services_seen[entry.service] = {
+                    'category': entry.category, 'icon': entry.icon,
+                    'country': entry.country, 'city': entry.city,
+                    'org': entry.org, 'lat': entry.lat, 'lon': entry.lon,
+                    'last_seen': now,
+                }
+        with self.lock:
+            stale = [k for k, v in self.connections.items() if k not in active_keys
+                     and now - v.last_seen > 60]
+            for k in stale:
+                del self.connections[k]
+        self.scan_count += 1
+
+    def get_all(self) -> list[dict]:
+        with self.lock:
+            return [e.to_dict() for e in self.connections.values()]
+
+    def get_map_points(self) -> list[dict]:
+        seen_ips = {}
+        with self.lock:
+            for entry in self.connections.values():
+                if (entry.lat != 0 or entry.lon != 0) and entry.remote_ip not in seen_ips:
+                    seen_ips[entry.remote_ip] = {
+                        'ip': entry.remote_ip, 'lat': entry.lat, 'lon': entry.lon,
+                        'service': entry.service, 'icon': entry.icon,
+                        'city': entry.city, 'country': entry.country,
+                        'org': entry.org, 'process': entry.process_name,
+                    }
+        return list(seen_ips.values())
+
+    def get_services_summary(self) -> list[dict]:
+        with self.lock:
+            return [{'service': name, **info} for name, info in self.services_seen.items()]
+
+    def get_stats(self) -> dict:
+        with self.lock:
+            n_conns = len(self.connections)
+            n_services = len(self.services_seen)
+        return {
+            'total_connections': n_conns,
+            'unique_services': n_services,
+            'unique_ips': len(self.total_unique_ips),
+            'scans': self.scan_count,
+        }
+
+    def format_terminal_line(self, entry: ConnectionEntry) -> str:
+        geo = f"{entry.city}, {entry.country_code}" if entry.city != '??' else entry.country_code
+        coords = f"({entry.lat:.2f}, {entry.lon:.2f})" if entry.lat or entry.lon else ""
+        return (f"  {entry.icon} {entry.service:20s} | {entry.process_name:20s} | "
+                f"{entry.remote_ip:15s}:{entry.remote_port:<5d} | "
+                f"{geo:20s} {coords} | {entry.org}")
+
+    def run_thread(self):
+        _mb_logger.info("Connection inventory thread started")
+        first_scan = True
+        while not self.stop.is_set():
+            self.scan()
+            if first_scan or self.scan_count % 12 == 0:
+                self._log_summary()
+                first_scan = False
+            time.sleep(5)
+
+    def _log_summary(self):
+        entries = self.get_all()
+        if not entries:
+            return
+        stats = self.get_stats()
+        print(f"\n{Colors.G}{'='*100}")
+        print(f"{EMOJI['chess']} CONNECTION MAP — {stats['total_connections']} active | "
+              f"{stats['unique_services']} services | {stats['unique_ips']} unique IPs")
+        print(f"{'='*100}{Colors.END}")
+        by_cat = defaultdict(list)
+        for e in entries:
+            by_cat[e['category']].append(e)
+        for cat in sorted(by_cat.keys()):
+            conns = by_cat[cat]
+            print(f"{Colors.C}  [{cat}]{Colors.END}")
+            for c in conns[:15]:
+                geo = f"{c['city']}, {c['country_code']}" if c['city'] != '??' else c['country_code']
+                coords = f"({c['lat']:.2f}, {c['lon']:.2f})" if c['lat'] or c['lon'] else ""
+                print(f"    {c['icon']} {c['service']:20s} | {c['process']:18s} | "
+                      f"{c['remote_ip']:15s}:{c['remote_port']:<5d} | "
+                      f"{geo:20s} {coords}")
+            if len(conns) > 15:
+                print(f"    ... and {len(conns)-15} more")
+        print(f"{Colors.G}{'='*100}{Colors.END}\n")
+
+
+# ========================== DASHBOARD ==========================
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MedianBoxMonitor Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c0c0c0;font-family:'Consolas','Fira Code',monospace;font-size:13px}
+.header{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:12px 24px;border-bottom:2px solid #0f3460;display:flex;justify-content:space-between;align-items:center}
+.header h1{color:#e94560;font-size:18px;text-shadow:0 0 20px rgba(233,69,96,0.5)}
+.header .stats{display:flex;gap:16px}
+.stat{text-align:center}.stat .val{font-size:20px;font-weight:bold;color:#00d4ff}.stat .lbl{font-size:9px;color:#666}
+.tabs{display:flex;background:#12121a;border-bottom:2px solid #1a1a2e}
+.tab{padding:10px 20px;cursor:pointer;color:#666;font-size:12px;text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid transparent;transition:all .2s}
+.tab:hover{color:#c0c0c0}.tab.active{color:#e94560;border-bottom-color:#e94560}
+.tab-content{display:none;height:calc(100vh - 115px);overflow:hidden}
+.tab-content.active{display:block}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;height:100%;overflow:hidden}
+.grid-3{display:grid;grid-template-columns:1fr;gap:10px;padding:10px;height:100%}
+.panel{background:#12121a;border:1px solid #1a1a2e;border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+.panel-title{background:#1a1a2e;padding:6px 14px;font-size:11px;font-weight:bold;color:#e94560;text-transform:uppercase;letter-spacing:1px}
+.panel-body{overflow-y:auto;padding:6px;flex:1}
+#map-container{height:50vh;border-radius:8px;overflow:hidden;border:1px solid #1a1a2e}
+table{width:100%;border-collapse:collapse}
+th{position:sticky;top:0;background:#1a1a2e;color:#0f3460;font-size:10px;text-align:left;padding:3px 6px;text-transform:uppercase}
+td{padding:2px 6px;border-bottom:1px solid #1a1a2e;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
+tr:hover{background:#1a1a2e}
+.risk-critical{color:#e94560;font-weight:bold}.risk-warning{color:#f5a623}.risk-low{color:#4caf50}
+.sev-CRITICAL{background:#e9456022;color:#e94560;padding:2px 6px;border-radius:3px;font-weight:bold;font-size:10px}
+.sev-WARNING{background:#f5a62322;color:#f5a623;padding:2px 6px;border-radius:3px;font-size:10px}
+.sev-INFO{background:#4caf5022;color:#4caf50;padding:2px 6px;border-radius:3px;font-size:10px}
+.conn-row{display:flex;align-items:center;padding:4px 8px;border-bottom:1px solid #1a1a2e;gap:8px;font-size:11px}
+.conn-row:hover{background:#1a1a2e}
+.conn-icon{font-size:16px;min-width:22px;text-align:center}
+.conn-svc{color:#00d4ff;font-weight:bold;min-width:130px}
+.conn-proc{color:#f5a623;min-width:120px}
+.conn-ip{color:#888;min-width:150px;font-family:monospace}
+.conn-geo{color:#4caf50;min-width:160px}
+.conn-coords{color:#666;font-size:10px;min-width:120px}
+.conn-org{color:#888;flex:1;overflow:hidden;text-overflow:ellipsis}
+.cat-header{padding:6px 12px;background:#0f3460;color:#00d4ff;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;margin-top:2px}
+.device{padding:3px 0;border-bottom:1px solid #1a1a2e;display:flex;justify-content:space-between;font-size:11px}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0a0a0f}::-webkit-scrollbar-thumb{background:#1a1a2e;border-radius:3px}
+.leaflet-popup-content{font-family:'Consolas',monospace;font-size:12px;color:#222}
+.leaflet-popup-content b{color:#e94560}
+</style></head><body>
+<div class="header">
+  <h1>&#9823; MedianBoxMonitor 3.0</h1>
+  <div class="stats">
+    <div class="stat"><div class="val" id="s-conn">-</div><div class="lbl">CONNECTIONS</div></div>
+    <div class="stat"><div class="val" id="s-svc">-</div><div class="lbl">SERVICES</div></div>
+    <div class="stat"><div class="val" id="s-ips">-</div><div class="lbl">UNIQUE IPs</div></div>
+    <div class="stat"><div class="val" id="s-proc">-</div><div class="lbl">PROCESSES</div></div>
+    <div class="stat"><div class="val" id="s-ded">-</div><div class="lbl">DEDUCTIONS</div></div>
+    <div class="stat"><div class="val" id="s-dev">-</div><div class="lbl">DEVICES</div></div>
+    <div class="stat"><div class="val" id="s-idle">-</div><div class="lbl">IDLE (s)</div></div>
+  </div>
+</div>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('map')">&#127758; Connection Map</div>
+  <div class="tab" onclick="switchTab('list')">&#128196; All Connections</div>
+  <div class="tab" onclick="switchTab('deductions')">&#128680; Deductions</div>
+  <div class="tab" onclick="switchTab('processes')">&#128202; Processes</div>
+  <div class="tab" onclick="switchTab('devices')">&#127381; Devices</div>
+</div>
+<!-- TAB 1: Connection Map -->
+<div id="tab-map" class="tab-content active">
+  <div class="grid" style="grid-template-columns:1fr;grid-template-rows:55% 45%">
+    <div id="map-container"></div>
+    <div class="panel"><div class="panel-title">&#128225; Active Services</div>
+      <div class="panel-body" id="svc-body"></div>
+    </div>
+  </div>
+</div>
+<!-- TAB 2: All Connections -->
+<div id="tab-list" class="tab-content">
+  <div class="grid-3"><div class="panel"><div class="panel-title">&#128279; All Active Connections (auto-discovered)</div>
+    <div class="panel-body" id="conn-body"></div>
+  </div></div>
+</div>
+<!-- TAB 3: Deductions -->
+<div id="tab-deductions" class="tab-content">
+  <div class="grid-3"><div class="panel"><div class="panel-title">&#128680; Live Deductions</div><div class="panel-body">
+    <table><thead><tr><th>Time</th><th>Sev</th><th>Cat</th><th>Process</th><th>Message</th><th>Score</th></tr></thead><tbody id="ded-table"></tbody></table>
+  </div></div></div>
+</div>
+<!-- TAB 4: Processes -->
+<div id="tab-processes" class="tab-content">
+  <div class="grid-3"><div class="panel"><div class="panel-title">&#128202; Process Risk Scores</div><div class="panel-body">
+    <table><thead><tr><th>PID</th><th>Name</th><th>Risk</th><th>Conn</th><th>Dst</th><th>ML</th><th>Countries</th></tr></thead><tbody id="proc-table"></tbody></table>
+  </div></div></div>
+</div>
+<!-- TAB 5: Devices -->
+<div id="tab-devices" class="tab-content">
+  <div class="grid-3"><div class="panel"><div class="panel-title">&#127381; Network Devices</div>
+    <div class="panel-body" id="dev-body"></div>
+  </div></div>
+</div>
+<script>
+// === Map Setup ===
+const map=L.map('map-container',{zoomControl:true}).setView([30,0],2);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
+  attribution:'&copy; OSM &copy; CARTO',maxZoom:18,subdomains:'abcd'
+}).addTo(map);
+const markers={};
+function updateMap(points){
+  const seen=new Set();
+  (points||[]).forEach(p=>{
+    if(!p.lat&&!p.lon)return;
+    const k=p.ip;seen.add(k);
+    if(markers[k]){markers[k].setPopupContent(popupHtml(p));return}
+    const m=L.circleMarker([p.lat,p.lon],{radius:6,color:'#e94560',fillColor:'#00d4ff',fillOpacity:0.8,weight:1}).addTo(map);
+    m.bindPopup(popupHtml(p));markers[k]=m;
+  });
+  Object.keys(markers).forEach(k=>{if(!seen.has(k)){map.removeLayer(markers[k]);delete markers[k]}});
+}
+function popupHtml(p){
+  const d=document.createElement('div');
+  d.innerHTML='';
+  const b1=document.createElement('b');b1.textContent=p.service+' '+p.icon;d.appendChild(b1);
+  d.appendChild(document.createElement('br'));
+  const t1=document.createTextNode(p.ip+' ('+p.process+')');d.appendChild(t1);
+  d.appendChild(document.createElement('br'));
+  const t2=document.createTextNode(p.city+', '+p.country);d.appendChild(t2);
+  d.appendChild(document.createElement('br'));
+  const sm=document.createElement('small');sm.textContent=p.org+' | '+p.lat.toFixed(4)+', '+p.lon.toFixed(4);d.appendChild(sm);
+  return d.innerHTML;
+}
+// === Tab Switching ===
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.querySelectorAll('.tab').forEach(t=>{if(t.textContent.toLowerCase().includes(name.slice(0,4)))t.classList.add('active')});
+  if(name==='map')setTimeout(()=>map.invalidateSize(),100);
+}
+// === DOM Helpers ===
+function mkTd(text){const td=document.createElement('td');td.textContent=text;return td}
+function mkRow(cells){const tr=document.createElement('tr');cells.forEach(c=>{if(typeof c==='object')tr.appendChild(c);else tr.appendChild(mkTd(c))});return tr}
+function riskClass(r){return r>=70?'risk-critical':r>=40?'risk-warning':'risk-low'}
+function sevClass(s){return{'CRITICAL':'sev-CRITICAL','WARNING':'sev-WARNING','INFO':'sev-INFO'}[s]||'sev-INFO'}
+// === Connection List ===
+function updateConnections(conns){
+  const body=document.getElementById('conn-body');body.replaceChildren();
+  if(!conns||!conns.length){body.textContent='Scanning connections...';return}
+  const byCat={};
+  conns.forEach(c=>{if(!byCat[c.category])byCat[c.category]=[];byCat[c.category].push(c)});
+  Object.keys(byCat).sort().forEach(cat=>{
+    const hdr=document.createElement('div');hdr.className='cat-header';hdr.textContent=cat+' ('+byCat[cat].length+')';body.appendChild(hdr);
+    byCat[cat].forEach(c=>{
+      const row=document.createElement('div');row.className='conn-row';
+      const icon=document.createElement('span');icon.className='conn-icon';icon.textContent=c.icon;
+      const svc=document.createElement('span');svc.className='conn-svc';svc.textContent=c.service;
+      const proc=document.createElement('span');proc.className='conn-proc';proc.textContent=c.process;
+      const ip=document.createElement('span');ip.className='conn-ip';ip.textContent=c.remote_ip+':'+c.remote_port;
+      const geo=document.createElement('span');geo.className='conn-geo';
+      geo.textContent=(c.city&&c.city!=='??')?c.city+', '+c.country_code:c.country_code;
+      const coords=document.createElement('span');coords.className='conn-coords';
+      coords.textContent=(c.lat||c.lon)?'('+c.lat.toFixed(2)+', '+c.lon.toFixed(2)+')':'';
+      const org=document.createElement('span');org.className='conn-org';org.textContent=c.org||'';
+      row.appendChild(icon);row.appendChild(svc);row.appendChild(proc);row.appendChild(ip);
+      row.appendChild(geo);row.appendChild(coords);row.appendChild(org);body.appendChild(row);
+    });
+  });
+}
+// === Services Summary ===
+function updateServices(svcs){
+  const body=document.getElementById('svc-body');body.replaceChildren();
+  if(!svcs||!svcs.length)return;
+  svcs.sort((a,b)=>(a.category||'').localeCompare(b.category||''));
+  svcs.forEach(s=>{
+    const row=document.createElement('div');row.className='conn-row';
+    const icon=document.createElement('span');icon.className='conn-icon';icon.textContent=s.icon;
+    const svc=document.createElement('span');svc.className='conn-svc';svc.textContent=s.service;
+    const geo=document.createElement('span');geo.className='conn-geo';
+    geo.textContent=(s.city&&s.city!=='??')?s.city+', '+s.country:'';
+    const org=document.createElement('span');org.className='conn-org';org.textContent=s.org||'';
+    const coords=document.createElement('span');coords.className='conn-coords';
+    coords.textContent=(s.lat||s.lon)?'('+s.lat.toFixed(2)+', '+s.lon.toFixed(2)+')':'';
+    row.appendChild(icon);row.appendChild(svc);row.appendChild(geo);row.appendChild(coords);row.appendChild(org);
+    body.appendChild(row);
+  });
+}
+// === Main Update ===
+function update(data){
+  document.getElementById('s-conn').textContent=data.conn_stats?data.conn_stats.total_connections:'-';
+  document.getElementById('s-svc').textContent=data.conn_stats?data.conn_stats.unique_services:'-';
+  document.getElementById('s-ips').textContent=data.conn_stats?data.conn_stats.unique_ips:'-';
+  document.getElementById('s-proc').textContent=data.processes?data.processes.length:'-';
+  document.getElementById('s-ded').textContent=data.deductions?data.deductions.length:'-';
+  document.getElementById('s-dev').textContent=data.devices?data.devices.length:'-';
+  document.getElementById('s-idle').textContent=data.idle_seconds||'-';
+  updateMap(data.map_points);
+  updateConnections(data.connections);
+  updateServices(data.services);
+  let dt=document.getElementById('ded-table');dt.replaceChildren();
+  (data.deductions||[]).slice(0,50).forEach(d=>{
+    const sevTd=document.createElement('td');
+    const sevSpan=document.createElement('span');sevSpan.className=sevClass(d.severity);sevSpan.textContent=d.severity;
+    sevTd.appendChild(sevSpan);
+    const msgTd=document.createElement('td');msgTd.textContent=(d.message||'').slice(0,80);msgTd.title=d.message||'';
+    dt.appendChild(mkRow([d.time,sevTd,d.category,d.process+':'+d.pid,msgTd,String(d.score)]));
+  });
+  let pt=document.getElementById('proc-table');pt.replaceChildren();
+  (data.processes||[]).filter(p=>p.risk>0.1||p.connections>0).slice(0,60).forEach(p=>{
+    const riskTd=document.createElement('td');riskTd.textContent=p.risk;riskTd.className=riskClass(p.risk);
+    pt.appendChild(mkRow([String(p.pid),p.name,riskTd,String(p.connections),String(p.destinations),String(p.ml_score),(p.countries||[]).join(',')]));
+  });
+  let db=document.getElementById('dev-body');db.replaceChildren();
+  (data.devices||[]).forEach(d=>{
+    const div=document.createElement('div');div.className='device';
+    const s1=document.createElement('span');s1.textContent=(d.ip||'?')+' \\u2014 '+(d.vendor||'?')+' \\u2014 '+(d.hostname||'?');
+    const s2=document.createElement('span');s2.textContent=(d.os_guess||'?')+' | conf='+(d.confidence||0).toFixed(2);
+    div.appendChild(s1);div.appendChild(s2);db.appendChild(div);
+  });
+}
+const urlParams=new URLSearchParams(window.location.search);
+const authToken=urlParams.get('token')||'';
+const wsUrl='ws://'+location.host+'/ws'+(authToken?'?token='+encodeURIComponent(authToken):'');
+const apiUrl='/api/state'+(authToken?'?token='+encodeURIComponent(authToken):'');
+let ws=new WebSocket(wsUrl);
+ws.onmessage=e=>update(JSON.parse(e.data));
+ws.onclose=()=>setTimeout(()=>location.reload(),5000);
+setInterval(()=>{if(ws.readyState!==1)fetch(apiUrl).then(r=>r.json()).then(update).catch(()=>{})},5000);
+</script></body></html>"""
+
+
+def _check_token(request, token: str) -> bool:
+    """Validate bearer token from query param or Authorization header."""
+    if request.query_params.get('token') == token:
+        return True
+    auth = request.headers.get('authorization', '')
+    return bool(auth.startswith('Bearer ') and auth[7:] == token)
+
+
+def start_dashboard(get_state_fn, stop_event):
+    """Run the FastAPI dashboard (blocking — call from a daemon thread)."""
+    if not HAS_FASTAPI:
+        _mb_logger.info("FastAPI not installed — dashboard disabled")
+        return
+    if not CONFIG.get('dashboard_enabled'):
+        return
+
+    from fastapi.responses import PlainTextResponse
+    from starlette.requests import Request
+
+    app = FastAPI(title="MedianBoxMonitor Dashboard")
+    auth_token = CONFIG.get('dashboard_password', '')
+
+    @app.get("/", response_class=HTMLResponse)
+    async def root(request: Request):
+        if auth_token and not _check_token(request, auth_token):
+            return PlainTextResponse("401 Unauthorized — append ?token=YOUR_PASSWORD", status_code=401)
+        return DASHBOARD_HTML
+
+    @app.get("/api/state")
+    async def api_state(request: Request):
+        if auth_token and not _check_token(request, auth_token):
+            return PlainTextResponse("401 Unauthorized", status_code=401)
+        return JSONResponse(get_state_fn())
+
+    @app.websocket("/ws")
+    async def ws_endpoint(websocket: WebSocket):
+        import asyncio
+        if auth_token:
+            ws_token = websocket.query_params.get('token', '')
+            if ws_token != auth_token:
+                await websocket.close(code=4001, reason="Unauthorized")
+                return
+        await websocket.accept()
+        try:
+            while not stop_event.is_set():
+                state = get_state_fn()
+                await websocket.send_json(state)
+                await asyncio.sleep(3)
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            _mb_logger.debug("WebSocket error: %s", exc)
+
+    if auth_token:
+        _mb_logger.info("Dashboard authentication enabled (token required)")
+
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=CONFIG['dashboard_port'],
+                    log_level="warning")
+    except Exception as e:
+        _mb_logger.warning("Dashboard failed: %s", e)
+
+
+# ========================== MAIN MONITOR CLASS ==========================
+class MedianBoxMonitor:
+    def __init__(self, args):
+        self.args = args
+        self.lock = threading.RLock()
+        self.local_ip, self.subnet, self.network = self._detect_subnet()
+
+        # Database
+        self.db = DatabaseManager()
+
+        # Original LAN tracking
+        self.devices = {}
+        self.seen_composites = set()
+        self.remote_sessions = {}
+        self.probe_attempts = defaultdict(int)
+        self.flow_stats = defaultdict(lambda: deque(maxlen=400))
+        self.mac_to_ip_history = defaultdict(set)
+        self.last_alert = defaultdict(float)
+
+        # Connection cache — populated by dedicated mapper thread
+        self.conn_by_pid: dict[int, list] = defaultdict(list)
+        self.conn_by_raddr: dict[str, tuple] = {}
+        self.conn_cache_lock = threading.Lock()
+
+        # Deductive Chess Engine v2
+        self.dns_cache = DNSCache()
+        self.beacon_detector = BeaconDetector()
+        self.process_profiles: dict[int, ProcessProfile] = {}
+        self.process_actions = defaultdict(list)
+        self.deductions: deque = deque(maxlen=2000)
+        self.deduction_cooldowns: dict[str, float] = {}
+
+        # Behavioral baselines keyed by process NAME
+        self.name_baselines: dict[str, dict] = defaultdict(lambda: {
+            'typical_dsts': set(),
+            'dst_count_samples': deque(maxlen=200),
+            'pkt_rate_samples': deque(maxlen=200),
+            'samples': 0,
+        })
+
+        # Hardware / user-activity correlation
+        self.audio_active_pids: set[int] = set()
+        self.camera_active_pids: set[int] = set()
+        self.user_activity_ts: float = 0.0
+
+        # Pre-parsed known IP ranges
+        self.known_ranges: dict[str, list] = {}
+        for svc, cidrs in KNOWN_SERVICE_RANGES.items():
+            self.known_ranges[svc] = [ipaddress.ip_network(c, strict=False) for c in cidrs]
+
+        # Tier 1
+        self.sni_extractor = SNIExtractor()
+        self.dns_tunnel_detector = DNSTunnelingDetector()
+        self.entropy_analyzer = EntropyAnalyzer()
+
+        # Tier 2
+        self.geoip = GeoIPCache()
+        self.registry_monitor = RegistryMonitor()
+        self.user_idle = UserIdleMonitor()
+        self.registry_baseline_set = False
+
+        # Tier 3
+        self.escalation = AlertEscalation()
+        self.siem = SIEMOutput()
+        self.slog = setup_structured_logging()
+
+        # Tier 4
+        self.ml_baseline = StatisticalBaseline()
+        self.ja4plus = JA4Plus()
+
+        # Admin check
+        self._admin_mode = True
+        try:
+            psutil.net_connections(kind='inet')
+        except psutil.AccessDenied:
+            self._admin_mode = False
+
+        self.stop = threading.Event()
+
+        # Packet pipeline (queue-based async processing)
+        self.pipeline = PacketPipeline(
+            handler=self._packet_callback,
+            stop_event=self.stop,
+        )
+
+        # Shared connection snapshot (written by _connection_mapper, read by inventory + process watcher)
+        self._conn_snapshot = []
+        self._conn_snapshot_lock = threading.Lock()
+
+        # Service resolver + Connection inventory (reads from shared snapshot)
+        self.service_resolver = ServiceResolver()
+        self.conn_inventory = ConnectionInventory(
+            dns_cache=self.dns_cache,
+            geoip=self.geoip,
+            service_resolver=self.service_resolver,
+            stop_event=self.stop,
+            conn_provider=self._get_conn_snapshot,
+        )
+
+        self._print_banner()
+
+    # ====================== BANNER ======================
+    def _print_banner(self):
+        self._log(f"{Colors.G}{EMOJI['brain']} MedianBoxMonitor 3.0 — MODULAR DEDUCTIVE CHESS ENGINE{Colors.END}")
+        self._log(f"Monitoring: {self.local_ip} -> {self.subnet}")
+        cap = [
+            'DNS-chess', 'SNI-extract', 'Beacon-detect', 'Legitimacy-check',
+            'Phantom-hunt', 'DNS-tunnel-detect', 'Entropy-analysis', 'Exfil-detect',
+        ]
+        if _IS_WINDOWS:
+            cap.extend(['DLL-inspect', 'Registry-monitor', 'User-idle', 'Memory-forensics'])
+        cap.extend(['GeoIP-enrich', 'Statistical-baseline', 'JA4+', 'Alert-escalation',
+                     'Queue-pipeline'])
+        if CONFIG['siem_output']:
+            cap.append(f"SIEM-{CONFIG['siem_output']}")
+        if HAS_FASTAPI and CONFIG['dashboard_enabled']:
+            cap.append(f"Dashboard:{CONFIG['dashboard_port']}")
+        if not self._admin_mode:
+            self._log(f"{Colors.Y}Running without admin — reduced capability{Colors.END}")
+        self._log(f"{Colors.M}Capabilities: {' | '.join(cap)}{Colors.END}")
+
+    # ====================== LOGGING ======================
+    def _log(self, msg, color=Colors.Y):
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} {color}{msg}{Colors.END}"
+        print(line)
+
+    def _safe_alert(self, msg, color=Colors.R):
+        key = msg.split('\u2192')[0].strip() if '\u2192' in msg else msg[:60]
+        now = time.time()
+        with self.lock:
+            if now - self.last_alert.get(key, 0) > CONFIG['alert_cooldown']:
+                self.last_alert[key] = now
+                self._log(msg, color=color)
+
+    def _write_action(self, pid, name, action, extra=""):
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"{ts} | {name} (PID {pid}) | {action} {extra}"
+        logging.getLogger('medianbox.actions').info(entry)
+        with self.lock:
+            self.process_actions[pid].append((time.time(), name, action, extra))
+
+    def _write_deduction_log(self, d: Deduction):
+        ts = datetime.datetime.fromtimestamp(d.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        entry = (f"{ts} | [{d.severity}] [{d.category}] {d.process_name} (PID {d.pid}) | "
+                 f"{d.message} | score={d.score:.1f} | evidence={d.evidence}")
+        logging.getLogger('medianbox.deductions').info(entry)
+
+    # ====================== SUBNET DETECTION ======================
+    def _detect_subnet(self):
+        for _iface, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                if a.family == socket.AF_INET and not a.address.startswith('127') and a.netmask:
+                    try:
+                        net = ipaddress.IPv4Interface(f"{a.address}/{a.netmask}").network
+                        return a.address, str(net), net
+                    except Exception:
+                        continue
+        return "192.168.1.100", "192.168.1.0/24", ipaddress.IPv4Network("192.168.1.0/24")
+
+    # ====================== HELPERS ======================
+    def _composite_key(self, mac, ip):
+        return hashlib.sha256(f"{mac or 'nomac'}:{ip or 'noip'}".encode()).hexdigest()[:16]
+
+    def _extract_hostname(self, pkt):
+        if pkt.haslayer(DNS) and pkt[DNS].qr == 0:
+            try:
+                return pkt[DNS].qd.qname.decode(errors='ignore').rstrip('.')
+            except Exception as exc:
+                _mb_logger.debug("Hostname extract error: %s", exc)
+        if pkt.haslayer(BOOTP) and pkt.haslayer(DHCP):
+            for opt in pkt[DHCP].options:
+                if isinstance(opt, tuple) and opt[0] == 'hostname':
+                    return opt[1].decode(errors='ignore')
+        return None
+
+    def _passive_os(self, pkt):
+        if not pkt.haslayer(TCP) or not (pkt[TCP].flags & 0x02):
+            return "Unknown"
+        ttl = pkt[IP].ttl if pkt.haslayer(IP) else (pkt[IPv6].hlim if pkt.haslayer(IPv6) else 64)
+        win = pkt[TCP].window
+        if 50 <= ttl <= 70 and win >= 5000:
+            return "Linux 5.x/6.x"
+        if 110 <= ttl <= 130 and win <= 12000:
+            return "Windows 10/11"
+        if ttl >= 200:
+            return "macOS/BSD"
+        return "Unknown/other"
+
+    # ====================== DEDUCTIVE CHESS ENGINE v2 ======================
+    def _add_deduction(self, severity, category, proc_name, pid, message, evidence, score):
+        cooldown_key = f"{category}:{pid}:{hash(message[:80])}"
+        now = time.time()
+        with self.lock:
+            if now - self.deduction_cooldowns.get(cooldown_key, 0) < CONFIG['deduction_cooldown']:
+                return
+            self.deduction_cooldowns[cooldown_key] = now
+
+        multiplier = self.escalation.get_multiplier(pid)
+        escalated_score = score * multiplier
+        self.escalation.record(pid, escalated_score)
+        if multiplier > 1.0:
+            evidence.append(f"{EMOJI['escalate']} ESCALATED x{multiplier:.1f} ({score:.0f} -> {escalated_score:.0f})")
+            if severity == "WARNING" and escalated_score >= 50:
+                severity = "CRITICAL"
+
+        d = Deduction(now, severity, category, proc_name, pid, message, evidence, escalated_score)
+        with self.lock:
+            self.deductions.append(d)
+            if pid in self.process_profiles:
+                self.process_profiles[pid].risk_score += escalated_score
+                self.process_profiles[pid].risk_reasons.append(f"[{category}] {message}")
+                self.process_profiles[pid].escalation_hits += 1
+
+        emoji_map = {
+            "MIMIC": EMOJI['mimic'], "BEACON": EMOJI['beacon'],
+            "PHANTOM": EMOJI['phantom'], "IMPERSONATION": EMOJI['impersonate'],
+            "FOREIGN": EMOJI['foreign'], "ANOMALY": EMOJI['anomaly'],
+            "INJECTION": EMOJI['inject'], "TUNNEL": EMOJI['tunnel'],
+            "EXFIL": EMOJI['exfil'], "ENTROPY": EMOJI['entropy'],
+            "DLL": EMOJI['dll'], "PERSISTENCE": EMOJI['persist'],
+            "IDLE_ANOMALY": EMOJI['idle'], "ML_ANOMALY": EMOJI['ml'],
+        }
+        icon = emoji_map.get(category, EMOJI['chess'])
+        color = Colors.R if severity == "CRITICAL" else Colors.Y
+
+        self._log(f"{icon} [{severity}] {message}", color=color)
+        for e in evidence:
+            self._log(f"    -> {e}", color=Colors.C)
+
+        log_level = logging.CRITICAL if severity == "CRITICAL" else (
+            logging.WARNING if severity == "WARNING" else logging.INFO)
+        self.slog.log(log_level, f"[{category}] {message} | pid={pid} score={escalated_score:.1f}")
+
+        self._write_action(pid, proc_name, f"DEDUCTION_{category}", message)
+        self._write_deduction_log(d)
+        self.db.save_deduction(d)
+        self.siem.emit(d)
+
+    # ---------- DEDUCTION 1: Mimic Traffic ----------
+    def _check_mimic(self, profile, dst_ip, domains):
+        all_idents = {d.lower() for d in domains}
+        all_idents.add(dst_ip)
+        for service, keywords in MIMIC_KEYWORDS.items():
+            if any(kw in ident for kw in keywords for ident in all_idents):
+                app_running = any(
+                    service in p.name.lower()
+                    for p in self.process_profiles.values()
+                    if p.pid != profile.pid)
+                if ALLOWED_APPS.get(service) and not app_running:
+                    continue
+                if not app_running:
+                    suspicion = 30.0
+                    evidence = [
+                        f"Traffic matches '{service}' (keywords: {keywords})",
+                        f"But NO '{service}' process is running",
+                        f"Destinations: {', '.join(list(profile.destinations)[:5])}",
+                        f"Process: {profile.name} (PID {profile.pid}, exe={profile.exe_path})",
+                    ]
+                    self._add_deduction("WARNING", "MIMIC", profile.name, profile.pid,
+                        f"MIMIC: '{profile.name}' imitates '{service}' traffic "
+                        f"(suspicion={suspicion:.0f})", evidence, suspicion)
+
+    # ---------- DEDUCTION 2: Foreign Influence ----------
+    def _check_foreign(self, profile, dst_ip, domains):
+        try:
+            ip_obj = ipaddress.ip_address(dst_ip)
+            if not ip_obj.is_global:
+                return
+        except Exception:
+            return
+        proc_lower = profile.name.lower()
+        for service, ranges in self.known_ranges.items():
+            if service not in proc_lower:
+                continue
+            in_range = any(ip_obj in net for net in ranges)
+            if not in_range:
+                domain_str = ', '.join(domains) if domains else 'no resolved domain'
+                recent_cpu = any(c > 2 for c in list(profile.cpu_samples)[-10:])
+                evidence = [
+                    f"'{profile.name}' claims to be '{service}' service",
+                    f"Destination {dst_ip} ({domain_str}) NOT in known {service} IP ranges",
+                    f"User CPU activity: {'yes' if recent_cpu else 'NONE'}",
+                    f"Process exe: {profile.exe_path}",
+                ]
+                score = 25.0 if not recent_cpu else 15.0
+                self._add_deduction("WARNING", "FOREIGN", profile.name, profile.pid,
+                    f"FOREIGN: '{profile.name}' -> {dst_ip} ({domain_str}) "
+                    f"outside known {service} infrastructure", evidence, score)
+            break
+
+    # ---------- DEDUCTION 3: Behavioral Anomaly ----------
+    def _check_behavioral_anomaly(self, profile, dst_ip):
+        name_lower = profile.name.lower()
+        bl = self.name_baselines[name_lower]
+        if bl['samples'] >= CONFIG['baseline_min_samples']:
+            new_dsts = profile.destinations - bl['typical_dsts']
+            if len(new_dsts) > 3:
+                evidence = [
+                    f"Baseline: {len(bl['typical_dsts'])} typical dests over {bl['samples']} samples",
+                    f"{len(new_dsts)} NEW destinations: {', '.join(list(new_dsts)[:8])}",
+                    f"Domains: {', '.join(profile.dns_domains)}",
+                ]
+                self._add_deduction("WARNING", "ANOMALY", profile.name, profile.pid,
+                    f"BEHAVIORAL SHIFT: '{profile.name}' suddenly has "
+                    f"{len(new_dsts)} new destinations", evidence, 20.0)
+        bl['typical_dsts'].update(profile.destinations)
+        bl['dst_count_samples'].append(len(profile.destinations))
+        bl['samples'] += 1
+
+    # ---------- DEDUCTION 4: Beacon Detection ----------
+    def _check_beacon(self, profile):
+        if len(profile.packet_timestamps) < CONFIG['beacon_min_samples']:
+            return
+        is_beacon, confidence, desc = self.beacon_detector.analyze(profile.packet_timestamps)
+        if is_beacon and confidence > 0.4:
+            evidence = [desc, f"Destinations: {', '.join(list(profile.destinations)[:6])}",
+                        f"Exe: {profile.exe_path}", f"Connections: {profile.connection_count}"]
+            sev = "CRITICAL" if confidence > 0.7 else "WARNING"
+            self._add_deduction(sev, "BEACON", profile.name, profile.pid,
+                f"C2 BEACON: '{profile.name}' automated callback (confidence={confidence:.0%})",
+                evidence, confidence * 55)
+
+    # ---------- DEDUCTION 5: Process Impersonation ----------
+    def _check_impersonation(self, profile, proc):
+        if profile.checked_legitimacy:
+            return
+        profile.checked_legitimacy = True
+        reasons = ProcessLegitimacyChecker.check_all(proc)
+        for reason in reasons:
+            self._add_deduction("CRITICAL", "IMPERSONATION", profile.name, profile.pid,
+                f"IMPERSONATION: {reason}",
+                [reason, f"Exe: {profile.exe_path}",
+                 f"Parent: {profile.parent_name} (PID {profile.parent_pid})"], 45.0)
+
+    # ---------- DEDUCTION 6: Phantom Connections ----------
+    def _check_phantoms(self, active_pids):
+        try:
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.status == 'ESTABLISHED' and conn.raddr:
+                    if conn.pid is None or conn.pid == 0 or conn.pid not in active_pids:
+                        dst_ip = conn.raddr[0]
+                        domains = self.dns_cache.get_domains(dst_ip)
+                        evidence = [
+                            f"Connection: {conn.laddr} -> {conn.raddr}",
+                            f"PID: {conn.pid or 'NONE'} — not in active process list",
+                            f"Domains: {', '.join(domains) if domains else 'unknown'}",
+                        ]
+                        self._add_deduction("CRITICAL", "PHANTOM", "UNKNOWN", conn.pid or 0,
+                            f"PHANTOM: {conn.laddr} -> {conn.raddr} — "
+                            f"{'no owning process' if not conn.pid else f'PID {conn.pid} missing'}",
+                            evidence, 50.0)
+        except psutil.AccessDenied:
+            pass
+        except Exception as exc:
+            _mb_logger.debug("Phantom check error: %s", exc)
+
+    # ---------- DEDUCTION 7: Injection Chain ----------
+    def _check_injection_chain(self, profile):
+        if not profile.parent_name:
+            return
+        parent_lower = profile.parent_name.lower()
+        name_lower = profile.name.lower()
+        known_apps = {"chrome.exe", "firefox.exe", "msedge.exe", "explorer.exe",
+                      "zoom.exe", "teams.exe", "discord.exe", "slack.exe"}
+        if parent_lower in known_apps and name_lower not in known_apps and profile.connection_count > 2:
+            evidence = [
+                f"Parent: {profile.parent_name} (PID {profile.parent_pid})",
+                f"Child: {profile.name} (PID {profile.pid})",
+                f"Child has {profile.connection_count} network connections",
+                f"Child destinations: {', '.join(list(profile.destinations)[:5])}",
+            ]
+            self._add_deduction("WARNING", "INJECTION", profile.name, profile.pid,
+                f"INJECTION CHAIN: '{profile.parent_name}' spawned '{profile.name}' "
+                f"which has {profile.connection_count} connections", evidence, 30.0)
+
+    # ---------- DEDUCTION 8: DNS Tunneling ----------
+    def _check_dns_tunnel(self, qname, src_ip):
+        is_tunnel, score, evidence = self.dns_tunnel_detector.analyze_query(qname)
+        if is_tunnel:
+            self._add_deduction("CRITICAL", "TUNNEL", "DNS", 0,
+                f"DNS TUNNELING: suspicious query '{qname[:80]}...' from {src_ip}",
+                evidence, score)
+
+    # ---------- DEDUCTION 9: Data Exfiltration ----------
+    def _check_exfil(self, profile, proc):
+        try:
+            io_counters = proc.io_counters()
+            now = time.time()
+            if profile.io_snapshot_time > 0:
+                dt = now - profile.io_snapshot_time
+                if dt > 0:
+                    sent_rate = (io_counters.write_bytes - profile.io_baseline_sent) / dt
+                    self.ml_baseline.record(profile.name.lower(), profile.connection_count,
+                        len(profile.destinations), sent_rate,
+                        statistics.mean(profile.cpu_samples) if profile.cpu_samples else 0)
+                    if (sent_rate > CONFIG['exfil_min_bytes'] / 60 and
+                            io_counters.write_bytes - profile.io_baseline_sent > CONFIG['exfil_min_bytes']):
+                        evidence = [
+                            f"Send rate: {sent_rate/1024:.0f} KB/s",
+                            f"Total sent: {(io_counters.write_bytes - profile.io_baseline_sent)/1024/1024:.1f} MB",
+                            f"Destinations: {', '.join(list(profile.destinations)[:5])}",
+                        ]
+                        idle_sec = self.user_idle.get_idle_seconds()
+                        if idle_sec > CONFIG['user_idle_threshold']:
+                            evidence.append(f"User idle for {idle_sec:.0f}s")
+                        self._add_deduction("CRITICAL", "EXFIL", profile.name, profile.pid,
+                            f"DATA EXFILTRATION: '{profile.name}' uploading {sent_rate/1024:.0f} KB/s",
+                            evidence, 40.0)
+            with self.lock:
+                profile.io_baseline_sent = io_counters.write_bytes
+                profile.io_baseline_recv = io_counters.read_bytes
+                profile.io_snapshot_time = now
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    # ---------- DEDUCTION 10: DLL Injection ----------
+    def _check_dlls(self, profile, proc):
+        if profile.checked_dlls or not _IS_WINDOWS:
+            return
+        profile.checked_dlls = True
+        suspicious = DLLInspector.inspect(proc)
+        if suspicious:
+            profile.loaded_dlls = suspicious
+            evidence = [f"Suspicious DLL: {dll}" for dll in suspicious[:10]]
+            self._add_deduction("CRITICAL", "DLL", profile.name, profile.pid,
+                f"DLL INJECTION: '{profile.name}' has {len(suspicious)} suspicious modules",
+                evidence, 40.0)
+
+    # ---------- DEDUCTION 11: Persistence Changes ----------
+    def _check_persistence(self):
+        changes = self.registry_monitor.scan()
+        for action, key_path, value in changes:
+            if not self.registry_baseline_set:
+                continue
+            evidence = [f"Action: {action}", f"Key: {key_path}", f"Value: {value[:200]}"]
+            sev = "CRITICAL" if action == "ADDED" else "WARNING"
+            self._add_deduction(sev, "PERSISTENCE", "Registry", 0,
+                f"PERSISTENCE {action}: {key_path}", evidence,
+                35.0 if action == "ADDED" else 15.0)
+        if not self.registry_baseline_set and changes is not None:
+            self.registry_baseline_set = True
+
+    # ---------- DEDUCTION 12: User Idle Anomaly ----------
+    def _check_idle_anomaly(self, profile):
+        idle_sec = self.user_idle.get_idle_seconds()
+        if idle_sec < CONFIG['user_idle_threshold']:
+            return
+        if profile.connection_count > 5 and profile.last_network_ts > time.time() - 30:
+            recent_cpu = any(c > 3 for c in list(profile.cpu_samples)[-10:])
+            if not recent_cpu:
+                evidence = [
+                    f"User idle: {idle_sec:.0f}s",
+                    f"'{profile.name}' has {profile.connection_count} active connections",
+                    "No recent CPU activity from this process",
+                ]
+                self._add_deduction("WARNING", "IDLE_ANOMALY", profile.name, profile.pid,
+                    f"IDLE ANOMALY: '{profile.name}' active while user idle {idle_sec:.0f}s",
+                    evidence, 15.0)
+
+    # ---------- DEDUCTION 13: Statistical Anomaly ----------
+    def _check_ml_anomaly(self, profile):
+        if len(profile.cpu_samples) < 5:
+            return
+        cpu_mean = statistics.mean(profile.cpu_samples) if profile.cpu_samples else 0
+        ml_score, anomalies = self.ml_baseline.score(
+            profile.name.lower(), profile.connection_count,
+            len(profile.destinations), profile.bytes_sent, cpu_mean)
+        profile.ml_anomaly_score = ml_score
+        if ml_score > 30 and anomalies:
+            evidence = [*anomalies, f"Overall anomaly score: {ml_score:.1f}", f"Process: {profile.name} (PID {profile.pid})"]
+            sev = "CRITICAL" if ml_score > 60 else "WARNING"
+            self._add_deduction(sev, "ML_ANOMALY", profile.name, profile.pid,
+                f"STATISTICAL ANOMALY: '{profile.name}' deviates from baseline (score={ml_score:.0f})",
+                evidence, ml_score * 0.5)
+
+    # ---------- DEDUCTION 14: GeoIP Enrichment ----------
+    def _check_geoip(self, profile, dst_ip, domains):
+        try:
+            ip_obj = ipaddress.ip_address(dst_ip)
+            if not ip_obj.is_global:
+                return
+        except Exception:
+            return
+        geo = self.geoip.lookup(dst_ip)
+        if geo:
+            country = geo.get('countryCode', '??')
+            org = geo.get('org', 'Unknown')
+            with self.lock:
+                profile.geo_countries.add(country)
+            if country in CONFIG.get('high_risk_countries', set()):
+                idle_sec = self.user_idle.get_idle_seconds()
+                recent_cpu = any(c > 2 for c in list(profile.cpu_samples)[-10:])
+                if not recent_cpu and idle_sec > CONFIG['user_idle_threshold']:
+                    evidence = [
+                        f"Destination: {dst_ip} -> {country} ({org})",
+                        f"Domains: {', '.join(domains) if domains else 'none'}",
+                        f"User idle: {idle_sec:.0f}s" if idle_sec > 60 else "User recently active",
+                        f"Process: {profile.name} exe={profile.exe_path}",
+                    ]
+                    self._add_deduction("WARNING", "FOREIGN", profile.name, profile.pid,
+                        f"GEO ALERT: '{profile.name}' -> {dst_ip} ({country}, {org})",
+                        evidence, 20.0)
+
+    # ---------- Risk Score Management ----------
+    def _update_risk(self, profile):
+        profile.risk_score = max(0, profile.risk_score * 0.997)
+        if profile.risk_score > CONFIG['risk_critical']:
+            self._safe_alert(
+                f"{EMOJI['alert']} HIGH RISK: '{profile.name}' (PID {profile.pid}) "
+                f"score={profile.risk_score:.0f}", Colors.R)
+
+    # ====================== CONNECTION MAPPER ======================
+    def _get_conn_snapshot(self) -> list:
+        """Return the latest connection snapshot (used by ConnectionInventory)."""
+        with self._conn_snapshot_lock:
+            return list(self._conn_snapshot)
+
+    def _connection_mapper(self):
+        while not self.stop.is_set():
+            try:
+                raw_conns = psutil.net_connections(kind='inet')
+                # Store raw snapshot for ConnectionInventory (single psutil call)
+                with self._conn_snapshot_lock:
+                    self._conn_snapshot = raw_conns
+                # Build indexed views for process watcher
+                by_pid = defaultdict(list)
+                by_raddr = {}
+                for conn in raw_conns:
+                    if conn.pid:
+                        by_pid[conn.pid].append(conn)
+                    if conn.raddr:
+                        by_raddr[conn.raddr[0]] = (conn.pid, conn)
+                with self.conn_cache_lock:
+                    self.conn_by_pid = by_pid
+                    self.conn_by_raddr = by_raddr
+            except psutil.AccessDenied:
+                pass
+            except Exception as exc:
+                _mb_logger.debug("Connection mapper error: %s", exc)
+            time.sleep(2)
+
+    # ====================== PROCESS WATCHER ======================
+    def _process_watcher(self):
+        last_pids: set[int] = set()
+        while not self.stop.is_set():
+            current_pids: set[int] = set()
+            with self.conn_cache_lock:
+                conn_by_pid = dict(self.conn_by_pid)
+            self._detect_hardware_activity()
+
+            for proc in psutil.process_iter(['pid', 'name', 'ppid', 'exe', 'cpu_percent']):
+                try:
+                    pid = proc.pid
+                    name = proc.name()
+                    current_pids.add(pid)
+                    with self.lock:
+                        if pid not in self.process_profiles:
+                            profile = ProcessProfile(
+                                pid=pid, name=name, exe_path=proc.exe() or "",
+                                parent_pid=proc.ppid() or 0,
+                                start_time=proc.create_time() if hasattr(proc, 'create_time') else time.time(),
+                            )
+                            try:
+                                profile.parent_name = psutil.Process(profile.parent_pid).name()
+                            except Exception:
+                                profile.parent_name = ""
+                            self.process_profiles[pid] = profile
+                            self._write_action(pid, name, "STARTED",
+                                f"exe={profile.exe_path} parent={profile.parent_name}")
+                        profile = self.process_profiles[pid]
+
+                    cpu = proc.cpu_percent(interval=None)
+                    with self.lock:
+                        profile.cpu_samples.append(cpu)
+                        if cpu > 5:
+                            self.user_activity_ts = time.time()
+
+                    self._check_impersonation(profile, proc)
+                    for conn in conn_by_pid.get(pid, []):
+                        if conn.raddr:
+                            dst_ip = conn.raddr[0]
+                            with self.lock:
+                                profile.destinations.add(dst_ip)
+                                profile.connection_count += 1
+                                profile.packet_timestamps.append(time.time())
+                                profile.last_network_ts = time.time()
+                            domains = self.dns_cache.get_domains(dst_ip)
+                            with self.lock:
+                                profile.dns_domains.update(domains)
+                            self._write_action(pid, name, "NETWORK_FLOW",
+                                f"-> {dst_ip}:{conn.raddr[1]} domains={domains or 'unresolved'}")
+                            self._check_mimic(profile, dst_ip, domains)
+                            self._check_foreign(profile, dst_ip, domains)
+                            self._check_behavioral_anomaly(profile, dst_ip)
+                            self._check_geoip(profile, dst_ip, domains)
+
+                    self._check_beacon(profile)
+                    if profile.connection_count > 0:
+                        self._check_injection_chain(profile)
+                    self._check_exfil(profile, proc)
+                    self._check_dlls(profile, proc)
+                    self._check_idle_anomaly(profile)
+                    self._check_ml_anomaly(profile)
+                    self._update_risk(profile)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                except Exception as exc:
+                    _mb_logger.debug("Process watcher error for PID %s: %s", pid, exc)
+
+            for pid in last_pids - current_pids:
+                with self.lock:
+                    if pid in self.process_profiles:
+                        prof = self.process_profiles[pid]
+                        self._write_action(pid, prof.name, "STOPPED")
+
+            self._check_phantoms(current_pids)
+            if _IS_WINDOWS:
+                self._check_persistence()
+            last_pids = current_pids
+            time.sleep(CONFIG['process_scan_interval'])
+
+    def _detect_hardware_activity(self):
+        audio_pids = set()
+        camera_pids = set()
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                name_lower = proc.name().lower()
+                if any(kw in name_lower for kw in HARDWARE_KEYWORDS['audio']):
+                    audio_pids.add(proc.pid)
+                if any(kw in name_lower for kw in HARDWARE_KEYWORDS['camera']):
+                    camera_pids.add(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        with self.lock:
+            self.audio_active_pids = audio_pids
+            self.camera_active_pids = camera_pids
+
+    # ====================== PACKET CALLBACK (via pipeline) ======================
+    def _packet_callback(self, pkt):
+        """Called by pipeline workers — not directly by sniff thread."""
+        if pkt.haslayer(DNS):
+            self.dns_cache.process_packet(pkt)
+            if pkt[DNS].qr == 0:
+                try:
+                    qname = pkt[DNS].qd.qname.decode(errors='ignore').rstrip('.')
+                    src_q = pkt[IP].src if pkt.haslayer(IP) else '?'
+                    self._check_dns_tunnel(qname, src_q)
+                except Exception as exc:
+                    _mb_logger.debug("DNS tunnel check error: %s", exc)
+
+        sni = self.sni_extractor.extract(pkt)
+        if sni:
+            dst_for_sni = pkt[IP].dst if pkt.haslayer(IP) else None
+            if dst_for_sni:
+                with self.dns_cache.lock:
+                    self.dns_cache.ip_to_domains[dst_for_sni].add(sni)
+                    self.dns_cache.domain_to_ips[sni].add(dst_for_sni)
+
+        if pkt.haslayer(Raw):
+            payload = bytes(pkt[Raw])
+            if len(payload) >= 32:
+                ent = self.entropy_analyzer.payload_entropy(payload)
+                is_sus, desc = self.entropy_analyzer.is_suspicious(pkt, ent)
+                if is_sus:
+                    src_e = pkt[IP].src if pkt.haslayer(IP) else '?'
+                    dst_e = pkt[IP].dst if pkt.haslayer(IP) else '?'
+                    self._add_deduction("WARNING", "ENTROPY", "packet", 0,
+                        f"HIGH ENTROPY PAYLOAD: {src_e} -> {dst_e}: {desc}",
+                        [desc, f"Payload size: {len(payload)} bytes"], 15.0)
+
+        ja4s = self.ja4plus.ja4s(pkt)
+        ja4h = self.ja4plus.ja4h(pkt)
+
+        if not (pkt.haslayer(IP) or pkt.haslayer(IPv6)):
+            return
+
+        src = pkt[IP].src if pkt.haslayer(IP) else pkt[IPv6].src
+        dst = pkt[IP].dst if pkt.haslayer(IP) else pkt[IPv6].dst
+        dport = pkt[TCP].dport if pkt.haslayer(TCP) else (pkt[UDP].dport if pkt.haslayer(UDP) else 0)
+
+        mac = pkt[Ether].src.upper() if pkt.haslayer(Ether) else None
+        try:
+            if self.network and ipaddress.ip_address(src) not in self.network:
+                if not (src.startswith('fe80') or src.startswith('fd')):
+                    return
+        except Exception:
+            return
+
+        comp_key = self._composite_key(mac, src)
+        now = time.time()
+
+        with self.lock:
+            if comp_key not in self.seen_composites:
+                vendor = get_vendor(mac)
+                hostname = self._extract_hostname(pkt) or "Hidden"
+                dev = {
+                    'mac': mac, 'ip': src, 'vendor': vendor, 'hostname': hostname,
+                    'os_guess': self._passive_os(pkt), 'first_seen': now, 'last_seen': now,
+                    'confidence': 0.4, 'anomaly_count': 0,
+                    'ja4': self.ja4plus.ja4(pkt),
+                }
+                self.devices[comp_key] = dev
+                self.seen_composites.add(comp_key)
+                self._log(f"{EMOJI['new']} NEW DEVICE -> {src:18} {vendor:14} {hostname}", color=Colors.Y)
+                self.db.save_device(comp_key, dev)
+            else:
+                dev = self.devices[comp_key]
+                if now - dev.get('last_seen', now) > 1800:
+                    dev['confidence'] = max(0.05, dev['confidence'] * 0.93)
+                dev['last_seen'] = now
+                dev['ip'] = src
+                dev['confidence'] = min(1.0, dev['confidence'] + 0.07)
+            if ja4s:
+                dev['ja4s'] = ja4s
+            if ja4h:
+                dev['ja4h'] = ja4h
+
+        proto = pkt[IP].proto if pkt.haslayer(IP) else 0
+        sport = pkt[TCP].sport if pkt.haslayer(TCP) else (pkt[UDP].sport if pkt.haslayer(UDP) else 0)
+        flow_key = (src, dst, proto, sport, dport)
+
+        with self.lock:
+            self.flow_stats[flow_key].append(now)
+            probe_count = 0
+            if pkt.haslayer(TCP) and pkt[TCP].flags & 0x02 and pkt[TCP].dport in CONFIG['probe_alert_ports']:
+                self.probe_attempts[src] += 1
+                probe_count = self.probe_attempts[src]
+
+            new_remote = False
+            s_port = d_port = 0
+            if pkt.haslayer(TCP) and (pkt[TCP].flags & 0x10):
+                s_port, d_port = pkt[TCP].sport, pkt[TCP].dport
+                if d_port in CONFIG['remote_ports'] or s_port in CONFIG['remote_ports']:
+                    session_key = (src, dst, s_port, d_port)
+                    if session_key not in self.remote_sessions:
+                        self.remote_sessions[session_key] = now
+                        new_remote = True
+
+            arp_spoof_mac = None
+            if mac and pkt.haslayer(ARP) and pkt[ARP].op == 2:
+                claimed = pkt[ARP].psrc
+                if claimed not in self.mac_to_ip_history[mac]:
+                    for other_mac, ips in self.mac_to_ip_history.items():
+                        if other_mac != mac and claimed in ips:
+                            arp_spoof_mac = (mac, claimed)
+                            break
+                self.mac_to_ip_history[mac].add(claimed)
+
+        if probe_count > 7:
+            self._safe_alert(f"{EMOJI['probe']} Active probe -> {src} ({probe_count} SYN attempts)", Colors.R)
+        if new_remote:
+            self._safe_alert(f"{EMOJI['remote']} REMOTE SESSION -> {src}:{s_port} -> {dst}:{d_port}", Colors.R)
+        if arp_spoof_mac:
+            self._safe_alert(f"{EMOJI['spoof']} ARP SPOOF -> {arp_spoof_mac[0]} claims {arp_spoof_mac[1]}", Colors.R)
+
+    # ====================== THREADS ======================
+    def _arp_thread(self):
+        while not self.stop.is_set():
+            try:
+                ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=str(self.network)),
+                             timeout=3, verbose=0)
+                for _, rcv in ans:
+                    fake = Ether(src=rcv.hwsrc)/IP(src=rcv.psrc)
+                    self.pipeline.enqueue(fake)
+            except Exception as exc:
+                _mb_logger.debug("ARP scan error: %s", exc)
+            time.sleep(random.uniform(CONFIG['scan_interval_min'], CONFIG['scan_interval_max']))
+
+    def _sniff_thread(self):
+        filt = "ip or ip6 or arp"
+        while not self.stop.is_set():
+            try:
+                sniff(prn=self.pipeline.enqueue, filter=filt, store=False,
+                      promisc=True, timeout=60,
+                      stop_filter=lambda _: self.stop.is_set())
+            except Exception as e:
+                _mb_logger.warning("Sniff error: %s — retrying in 5s", e)
+                time.sleep(5)
+
+    def _status_thread(self):
+        while not self.stop.is_set():
+            with self.lock:
+                n_procs = len(self.process_profiles)
+                n_deductions = len(self.deductions)
+                high_risk = sum(1 for p in self.process_profiles.values() if p.risk_score > CONFIG['risk_critical'])
+                n_dns = len(self.dns_cache.ip_to_domains)
+                n_geo = len(self.geoip.cache)
+            idle_sec = self.user_idle.get_idle_seconds()
+            ml_active = sum(1 for m in self.ml_baseline.models.values()
+                            if len(m['conn_rate']) >= 30)
+            pipe = self.pipeline.stats()
+            self._log(
+                f"{EMOJI['chess']} Status: {len(self.devices)} devices | "
+                f"{n_procs} processes | {n_deductions} deductions | "
+                f"{high_risk} high-risk | {n_dns} DNS | {n_geo} GeoIP | "
+                f"{ml_active} baselines | idle={idle_sec:.0f}s | "
+                f"pipe={pipe['processed']}/{pipe['dropped']}",
+                color=Colors.G)
+            time.sleep(15)
+
+    def _memory_forensics_thread(self):
+        if not _IS_WINDOWS:
+            return
+        MEM_COMMIT = 0x1000
+        PAGE_EXECUTE_READWRITE = 0x40
+        try:
+            class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p),
+                    ("AllocationProtect", ctypes.wintypes.DWORD), ("RegionSize", ctypes.c_size_t),
+                    ("State", ctypes.wintypes.DWORD), ("Protect", ctypes.wintypes.DWORD),
+                    ("Type", ctypes.wintypes.DWORD),
+                ]
+        except Exception:
+            return
+
+        while not self.stop.is_set():
+            with self.lock:
+                pids_to_check = [(pid, p.name) for pid, p in self.process_profiles.items()
+                                 if p.risk_score > 10 and p.connection_count > 0]
+            for pid, pname in pids_to_check[:20]:
+                if self.stop.is_set():
+                    break
+                try:
+                    handle = ctypes.windll.kernel32.OpenProcess(0x0400 | 0x0010, False, pid)
+                    if not handle:
+                        continue
+                    mbi = MEMORY_BASIC_INFORMATION()
+                    addr = 0
+                    rwx_regions = 0
+                    while ctypes.windll.kernel32.VirtualQueryEx(
+                            handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                        if mbi.State == MEM_COMMIT and mbi.Protect == PAGE_EXECUTE_READWRITE and mbi.RegionSize > 4096:
+                            rwx_regions += 1
+                        addr += mbi.RegionSize
+                        if addr > 0x7FFFFFFFFFFF:
+                            break
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    if rwx_regions > 2:
+                        evidence = [f"Process: {pname} (PID {pid})", f"RWX memory regions: {rwx_regions}",
+                                    "RWX pages indicate possible shellcode or reflective DLL injection"]
+                        self._add_deduction("CRITICAL", "DLL", pname, pid,
+                            f"MEMORY FORENSICS: '{pname}' has {rwx_regions} RWX memory regions",
+                            evidence, 45.0)
+                except Exception as exc:
+                    _mb_logger.debug("Memory forensics error for PID %s: %s", pid, exc)
+            time.sleep(30)
+
+    # ====================== DASHBOARD STATE ======================
+    def _get_dashboard_state(self) -> dict:
+        with self.lock:
+            processes = []
+            for _pid, p in list(self.process_profiles.items())[:200]:
+                processes.append({
+                    'pid': p.pid, 'name': p.name, 'exe': p.exe_path,
+                    'parent': p.parent_name, 'risk': round(p.risk_score, 1),
+                    'connections': p.connection_count,
+                    'destinations': len(p.destinations),
+                    'ml_score': round(p.ml_anomaly_score, 1),
+                    'countries': sorted(p.geo_countries),
+                })
+            deductions_list = []
+            for d in list(self.deductions)[-100:]:
+                deductions_list.append({
+                    'time': datetime.datetime.fromtimestamp(d.timestamp).strftime("%H:%M:%S"),
+                    'severity': d.severity, 'category': d.category,
+                    'process': d.process_name, 'pid': d.pid,
+                    'message': d.message, 'score': round(d.score, 1),
+                })
+            devices_list = list(self.devices.values())
+        pipe = self.pipeline.stats()
+        return {
+            'processes': processes, 'deductions': deductions_list,
+            'devices': devices_list, 'dns_count': len(self.dns_cache.ip_to_domains),
+            'geoip_count': len(self.geoip.cache),
+            'idle_seconds': round(self.user_idle.get_idle_seconds(), 0),
+            'pipeline_processed': pipe['processed'],
+            'pipeline_dropped': pipe['dropped'],
+            # Connection inventory data
+            'connections': self.conn_inventory.get_all(),
+            'map_points': self.conn_inventory.get_map_points(),
+            'services': self.conn_inventory.get_services_summary(),
+            'conn_stats': self.conn_inventory.get_stats(),
+        }
+
+    # ====================== RUN ======================
+    def run(self):
+        # Start packet pipeline workers
+        self.pipeline.start()
+
+        threads = [
+            threading.Thread(target=self._connection_mapper, daemon=True, name="Connection-Mapper"),
+            threading.Thread(target=self._process_watcher, daemon=True, name="Process-Watcher"),
+            threading.Thread(target=self._status_thread, daemon=True, name="Status-Reporter"),
+            threading.Thread(target=self.conn_inventory.run_thread, daemon=True, name="Connection-Inventory"),
+        ]
+        if self._admin_mode:
+            threads.append(threading.Thread(target=self._arp_thread, daemon=True, name="ARP-Scanner"))
+            threads.append(threading.Thread(target=self._sniff_thread, daemon=True, name="Packet-Sniffer"))
+        else:
+            self._log(f"{Colors.Y}Skipping packet capture (no admin). Process monitoring only.{Colors.END}")
+
+        if _IS_WINDOWS:
+            threads.append(threading.Thread(target=self._memory_forensics_thread,
+                                            daemon=True, name="Memory-Forensics"))
+        if HAS_FASTAPI and CONFIG.get('dashboard_enabled'):
+            threads.append(threading.Thread(
+                target=start_dashboard,
+                args=(self._get_dashboard_state, self.stop),
+                daemon=True, name="Dashboard"))
+
+        for t in threads:
+            t.start()
+            self._log(f"  Started thread: {t.name}", color=Colors.C)
+
+        if HAS_FASTAPI and CONFIG.get('dashboard_enabled'):
+            self._log(f"{EMOJI['dashboard']} Dashboard: http://127.0.0.1:{CONFIG['dashboard_port']}", color=Colors.G)
+
+        try:
+            while not self.stop.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self._log(f"{EMOJI['ok']} Shutting down...", color=Colors.C)
+        finally:
+            self.stop.set()
+            self.pipeline.drain(timeout=3)
+            for t in threads:
+                t.join(timeout=5)
+            self._log(f"{EMOJI['ok']} Stopped. Logs: {CONFIG['actions_log']}, {CONFIG['deductions_log']}")
+            # Generate desktop report on exit
+            try:
+                generate_medianbox_desktop_report(self)
+            except Exception as e:
+                self._log(f"Report generation failed: {e}", color=Colors.Y)
+
+
+# ========================== ENTRY POINT ==========================
+
+def generate_medianbox_desktop_report(monitor):
+    """Generate a summary report on the Desktop when MedianBox Monitor stops."""
+    try:
+        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        os.makedirs(desktop, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        report_path = os.path.join(desktop, f'MedianBox_Report_{timestamp}.txt')
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append(f"  MedianBox Monitor v3.0 — Session Report")
+        lines.append(f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 80)
+        lines.append("")
+
+        # Gather state
+        state = monitor._get_dashboard_state()
+
+        lines.append(f"Uptime: {state.get('uptime', 'N/A')}")
+        lines.append(f"Total Processes Tracked: {state.get('total_profiles', 0)}")
+        lines.append(f"Active Processes: {state.get('active_profiles', 0)}")
+        lines.append(f"Total Deductions Made: {state.get('total_deductions', 0)}")
+        lines.append(f"Packets Processed: {state.get('pipeline_processed', 0)}")
+        lines.append(f"Packets Dropped: {state.get('pipeline_dropped', 0)}")
+        lines.append("")
+
+        # Top risk processes
+        lines.append("-" * 40)
+        lines.append("TOP RISK PROCESSES:")
+        lines.append("-" * 40)
+        top_risk = state.get('top_risk', [])
+        if top_risk:
+            for entry in top_risk:
+                lines.append(f"  [{entry.get('risk', 0):.1f}] {entry.get('name', '?')} (PID {entry.get('pid', '?')})")
+        else:
+            lines.append("  (none)")
+        lines.append("")
+
+        # Recent deductions
+        lines.append("-" * 40)
+        lines.append("RECENT DEDUCTIONS:")
+        lines.append("-" * 40)
+        recent = state.get('recent_deductions', [])
+        if recent:
+            for d in recent[-30:]:
+                ts = datetime.datetime.fromtimestamp(d.get('timestamp', 0)).strftime('%H:%M:%S')
+                lines.append(f"  [{ts}] [{d.get('severity', '?')}] {d.get('category', '?')}: {d.get('message', '')}")
+        else:
+            lines.append("  (none)")
+        lines.append("")
+
+        # Connection stats
+        conn_stats = state.get('conn_stats', {})
+        if conn_stats:
+            lines.append("-" * 40)
+            lines.append("CONNECTION STATS:")
+            lines.append("-" * 40)
+            for k, v in conn_stats.items():
+                lines.append(f"  {k}: {v}")
+            lines.append("")
+
+        lines.append("=" * 80)
+        lines.append("  End of Report")
+        lines.append("=" * 80)
+
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+        print(f"[MedianBox] Desktop report saved: {report_path}")
+    except Exception as e:
+        print(f"[MedianBox] Could not generate desktop report: {e}")
+
+
+def medianbox_main():
+    parser = argparse.ArgumentParser(
+        description="MedianBoxMonitor 3.0 — Modular Deductive Chess Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--config', '-c', default=None,
+                        help='Path to YAML config file (default: medianbox_config.yaml)')
+    parser.add_argument('--no-dashboard', action='store_true',
+                        help='Disable web dashboard')
+    parser.add_argument('--no-geoip', action='store_true',
+                        help='Disable GeoIP lookups (privacy)')
+    parser.add_argument('--siem', choices=['json', 'cef', 'syslog'],
+                        help='Enable SIEM output format')
+    parser.add_argument('--port', type=int, default=None,
+                        help='Dashboard port (default: 8470)')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='Number of pipeline worker threads (default: 2)')
+    parser.add_argument('--dashboard-password', default=None,
+                        help='Require this password/token to access the dashboard')
+    parser.add_argument('--geoip-db', default=None,
+                        help='Path to MaxMind GeoLite2-City.mmdb for local offline GeoIP')
+
+    args = parser.parse_args()
+
+    # Load YAML config first
+    load_config(args.config)
+
+    # CLI overrides
+    if args.no_dashboard:
+        CONFIG['dashboard_enabled'] = False
+    if args.no_geoip:
+        CONFIG['geoip_enabled'] = False
+    if args.siem:
+        CONFIG['siem_output'] = args.siem
+    if args.port:
+        CONFIG['dashboard_port'] = args.port
+    if args.workers:
+        CONFIG['pipeline_workers'] = args.workers
+    if args.dashboard_password:
+        CONFIG['dashboard_password'] = args.dashboard_password
+    if args.geoip_db:
+        CONFIG['geoip_db_path'] = args.geoip_db
+
+    monitor = MedianBoxMonitor(args)
+    monitor.run()
+
+
+
 
 def _find_project_dir() -> Path:
     """Locate the real project directory containing Start PubLAN.bat.
@@ -5432,6 +8408,16 @@ def main():
             print(f"[WARNING] Could not open browser: {e}")
             print(f"         Navigate manually to http://127.0.0.1:{PORT}")
 
+        # Launch MedianBox Monitor in a separate popup terminal
+        try:
+            print("[OK] Launching MedianBox Monitor in a new terminal window...")
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), '--medianbox'],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not launch MedianBox Monitor: {e}")
+
         # Main thread blocks here forever
         while True:
             time.sleep(1)
@@ -5448,4 +8434,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if '--medianbox' in sys.argv:
+        sys.argv.remove('--medianbox')
+        medianbox_main()
+    else:
+        main()
