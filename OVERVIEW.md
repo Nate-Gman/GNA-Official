@@ -1,8 +1,9 @@
 # GNA Architecture Overview
 
-`Main_monolith.py` is the entire system in one file (~65k lines): the GNA
+`Main_monolith.py` is the entire system in one file (~67k lines): the GNA
 peer application, the embedded signaling/relay server, the screen-share
-sender source, and the complete MedianBox/GNA Tracer monitor.
+sender source, and the complete MedianBox/GNA Tracer monitor. The embedded
+monitor body is kept in sync with `medianbox_monitor_v2.py`.
 
 ## Process layout
 
@@ -10,9 +11,10 @@ sender source, and the complete MedianBox/GNA Tracer monitor.
 GNA.bat ──► GNA.py ──► import Main_monolith ──► main()
                                               ├─ Flask dashboard    :5000   (thread)
                                               ├─ MedianBox monitor  (new console process)
-                                              │    ├─ monitor threads (packet pipeline, GeoIP, RF, …)
+                                              │    ├─ monitor threads (packet pipeline, GeoIP, RF,
+                                              │    │    graph reasoner, …)
                                               │    ├─ FastAPI dashboard :8470
-                                              │    └─ GNATracerGUI (tkinter, 16 tabs)
+                                              │    └─ GNATracerGUI (tkinter, 18 tabs)
                                               ├─ PublicIP           (thread — external lookup)
                                               └─ ServiceBootstrap   (thread)
                                                    ├─ Zeroconf register + ServiceBrowser (mDNS LAN)
@@ -64,7 +66,7 @@ releases the GIL), then injects the real names into module globals so plain
 |------------|----------------------------------------------------------------|----------------------|
 | `flask`    | `Flask`, `Response`, `flask_request`, `jsonify`, `abort`, `redirect`, `send_from_directory`, `stream_with_context` | `main`, `create_routes` |
 | `socketio` | `socketio`                                                     | `_bootstrap_network_services`, `_start_embedded_relay`, `_embedded_sender_main`, `GlobalDiscoveryService.start`, `medianbox_main` |
-| `fastapi`  | `FastAPI`, `WebSocket*`, `HTMLResponse`, `JSONResponse`, `uvicorn` | `start_dashboard`, `medianbox_main` |
+| `fastapi`  | `FastAPI`, `WebSocket*`, `HTMLResponse`, `JSONResponse`, `Request`, `uvicorn` | `start_dashboard`, `medianbox_main` |
 | `pil`      | `Image`, `ImageTk`                                             | `_run_gui`, `TileManager.*`, `medianbox_main` |
 | `tkinter`  | `tk`, `ttk`, `scrolledtext`, `messagebox`                      | `_run_gui`, `medianbox_main` |
 | `asyncio`  | `asyncio`                                                      | `GlobalDiscoveryService.start`, `start_dashboard`, `medianbox_main` |
@@ -158,6 +160,32 @@ module-level `_HTTP_SESSION` need them at exec time).
   window-title check (3).
 - Remote-access sessions are registered on the relay; the dashboard banner +
   revoke button hit the relay's REST endpoints via `_relay_origin()`.
+
+## MedianBox monitor (`--medianbox`)
+
+Spawned as `python -m Main_monolith --medianbox` in a new console —
+`medianbox_main()` is the entry point; if the embedded spawn fails the
+launcher falls back to running `medianbox_monitor_v2.py` as a module. The
+monitor is MedianBoxMonitor 3.0: packet capture (scapy + Npcap), process and
+connection inventory, GeoIP + provider-range enrichment, Welford baselines,
+TLS/JA4+ client fingerprinting, VPN/proxy multi-verification (MultiVerifier),
+RF/wireless device tracking, and an `EvidenceGraph` consumed by the
+`Graph-Reasoner` thread which derives cross-protocol actor links and
+wireless-bypass deductions.
+
+FastAPI dashboard + API on `127.0.0.1:8470` (optional
+`dashboard_password`/`?token=` gate):
+
+| Route | Purpose |
+|-------|---------|
+| `GET /`, `GET /api/state`, `WS /ws` | Dashboard page, state snapshot, live stream |
+| `POST /v/inject`, `POST /v/flow`, `GET /v/flow/<id>/pace` | Flow watermarking — register a gap pattern, report observed gaps for correlation scoring, pacing advice |
+| `POST /v/dossier/outcome` | Feed dossier outcomes back into edge-method scoring |
+| `POST /federation/reputation`, `/federation/rtt`, `/federation/cluster` | Signed peer exchange — reputation records, RTT vantages, actor clusters (Ed25519 via PyNaCl when installed) |
+| `GET /federation/trilaterate/<ip>` | Fused RTT-trilaterated location for an IP |
+
+GUI: 18-tab tkinter "GNA Tracer" window; a startup crash re-raises so
+`MedianBoxMonitor.run()` falls back to terminal mode.
 
 ## Data files & vault
 

@@ -104,6 +104,7 @@ _LAZY_BIND = {
         'WebSocketDisconnect': ('fastapi', 'WebSocketDisconnect'),
         'HTMLResponse':        ('fastapi.responses', 'HTMLResponse'),
         'JSONResponse':        ('fastapi.responses', 'JSONResponse'),
+        'Request':             ('starlette.requests', 'Request'),
         'uvicorn':             ('uvicorn', None),
     },
     'pil':     {'Image': ('PIL.Image', None), 'ImageTk': ('PIL.ImageTk', None)},
@@ -204,6 +205,12 @@ try:
 except ImportError:
     _HAS_MANUF = False
     _PARSER = None
+
+try:
+    import nacl.signing as _nacl_signing  # noqa: F401
+    _HAS_ED25519 = True
+except ImportError:
+    _HAS_ED25519 = False
 
 try:
     import geoip2.database as _geoip2_db
@@ -1552,6 +1559,22 @@ def _classify_payload_head(data: bytes):
 # helper below either builds the one standard datagram the service
 # answers anyway, or decodes what is already on the wire.
 
+def _dns_wire_query(name: str, qtype: int = 1, qclass: int = 1,
+                    txid: int = 0x4d42) -> bytes:
+    """Build a minimal DNS wire-format query (no compression)."""
+    q = bytearray(struct.pack('!HHHHHH', txid, 0x0100, 1, 0, 0, 0))
+    for part in name.rstrip('.').split('.'):
+        try:
+            enc = part.encode('idna')
+        except Exception:
+            enc = part.encode('ascii', 'replace')
+        q.append(len(enc) & 0x3F)
+        q += enc
+    q.append(0)
+    q += struct.pack('!HH', qtype, qclass)
+    return bytes(q)
+
+
 def _dns_skip_name(data: bytes, off: int) -> int:
     """Skip a (possibly compressed) DNS name starting at off; returns
     the offset AFTER the name, or -1 when malformed."""
@@ -2661,6 +2684,1312 @@ class Deduction:
     message: str
     evidence: list
     score: float
+    mv_detail: dict = field(default_factory=dict)
+
+    @classmethod
+    def feed_graph_inference(cls, component: dict) -> 'Deduction':
+        """P13.4: build a deduction row from a graph-inference result —
+        an ACTOR_CLUSTER / ACTOR_CLUSTER_INFERRED / CONTRADICTION
+        component with the full path, per-edge kinds/confidences and
+        decay factors. The message is the human-readable chain:
+        'ip_a same actor as ip_b (fp 0.9, 1d) → ... therefore ip_a's
+        actor is in Seattle (0.72, inferred, 2-hop)'."""
+        now = time.time()
+        path = component.get('path') or []
+        edges = component.get('edges') or []
+        conf = component.get('conf', 0.0)
+        hops = component.get('hops') or max(0, len(path) - 1)
+        cat = component.get('category', 'ACTOR_CLUSTER_INFERRED')
+        # per-edge evidence rows with base + decayed confidence
+        evidence = []
+        parts = []
+        for i, e in enumerate(edges):
+            a, b = e.get('a', ''), e.get('b', '')
+            kind = e.get('kind', '?')
+            base = e.get('conf', 0.0)
+            age_d = e.get('age_days', 0.0)
+            dec = e.get('decayed_conf', base)
+            evidence.append(f"{a}—{kind}→{b} base={base:.2f} "
+                            f"decayed={dec:.2f} age={age_d:.1f}d")
+            seg = f"{a} is the same actor as {b} ({kind} {dec:.2f}"
+            parts.append(seg + (f", {age_d:.0f}d)" if age_d >= 1 else ")"))
+        loc = component.get('location') or {}
+        loc_str = loc.get('city') or loc.get('cc') or 'unknown'
+        chain = ' → '.join(parts)
+        summary = (f"{chain} → therefore {path[0] if path else '?'}'s actor "
+                   f"is in {loc_str} ({conf:.2f}, inferred, {hops}-hop)")
+        if cat == 'CONTRADICTION':
+            summary = (f"CONTRADICTION: {component.get('claim_a','?')} vs "
+                       f"{component.get('claim_b','?')} — resolved "
+                       f"{loc_str} ({conf:.2f})")
+        sev = 'LOW' if conf < 0.4 else ('MEDIUM' if conf < 0.8 else 'HIGH')
+        return cls(timestamp=now, severity=sev, category=cat,
+                   process_name=component.get('process_name', ''),
+                   pid=component.get('pid', 0),
+                   message=summary, evidence=evidence, score=conf)
+
+
+# ========================== P10: EVIDENCE GRAPH ==========================
+# Actor-clustering graph: nodes are IPs, edges are cross-IP links
+# (fingerprint match, SA-link, cert-link, flow-correlation, cross-protocol,
+# session-graph, watermark relay, etc.). Clusters of connected nodes are
+# *actors*. This is the deductive-chess board that P13 reasons over.
+class EvidenceGraph:
+    __slots__ = ('_nodes', '_edges', '_lock', '_clusters', '_cluster_dirty',
+                 '_version', '_last_cluster_sig', '_adj', '_ip_root')
+
+    def __init__(self):
+        self._nodes: dict[str, dict] = {}      # ip -> {first, last, mv_detail}
+        self._edges: dict[tuple, dict] = {}     # (ip_a, ip_b) -> {kind, conf, source, method, ts}
+        self._lock = threading.Lock()
+        self._clusters: dict[str, set] = {}     # cluster_id -> set of ips
+        self._cluster_dirty = True
+        self._version = 0                       # P13.5: bumps on every edge write
+        self._last_cluster_sig = {}             # cluster_key -> edges_hash (re-infer only on change)
+        self._adj: dict[str, set] = {}          # ip -> set of incident edge keys (append-only)
+        self._ip_root: dict[str, str] = {}      # ip -> cluster root, built by _rebuild_clusters
+
+    def observe(self, ip: str, mv_detail: dict | None = None):
+        """Register an IP node, optionally attaching mv_detail evidence."""
+        if not ip:
+            return
+        with self._lock:
+            n = self._nodes.get(ip)
+            now = time.time()
+            if n is None:
+                self._nodes[ip] = {'first': now, 'last': now, 'mv_detail': mv_detail or {}}
+            else:
+                n['last'] = now
+                if mv_detail:
+                    n['mv_detail'].update(mv_detail)
+            self._cluster_dirty = True
+
+    def add_edge(self, ip_a: str, ip_b: str, kind: str, conf: float,
+                 source: str = '', ts: float | None = None, method: str = ''):
+        """Add a cross-IP evidence edge. conf in [0,1]. Applies temporal decay
+        at read time, not write time (so stale edges weaken naturally).
+        P23: every edge carries (kind, conf, method, source, ts)."""
+        if not ip_a or not ip_b or ip_a == ip_b:
+            return
+        key = (ip_a, ip_b) if ip_a < ip_b else (ip_b, ip_a)
+        with self._lock:
+            old = self._edges.get(key)
+            if old is not None and old['kind'] != kind:
+                # Multi-kind pair: keep the stronger edge but remember every
+                # contributing method (n_methods in cluster_confidence).
+                kinds = set(old.get('kinds') or {old['kind']}) | {kind}
+                if conf <= old['conf']:
+                    old['kinds'] = kinds
+                    self._version += 1
+                    return
+                new = {'kind': kind, 'conf': max(0.0, min(1.0, conf)),
+                       'source': source, 'method': method or kind,
+                       'ts': ts or time.time(), 'kinds': kinds}
+                self._edges[key] = new
+            else:
+                kinds = set((old or {}).get('kinds') or {kind}) | {kind}
+                self._edges[key] = {
+                    'kind': kind, 'conf': max(0.0, min(1.0, conf)),
+                    'source': source, 'method': method or kind,
+                    'ts': ts or time.time(),
+                    'kinds': kinds,
+                }
+            self._adj.setdefault(ip_a, set()).add(key)
+            self._adj.setdefault(ip_b, set()).add(key)
+            self._nodes.setdefault(ip_a, {'first': time.time(), 'last': time.time(), 'mv_detail': {}})
+            self._nodes.setdefault(ip_b, {'first': time.time(), 'last': time.time(), 'mv_detail': {}})
+            self._cluster_dirty = True
+            self._version += 1
+
+    def _rebuild_clusters(self):
+        """Union-Find clustering: connected nodes = one actor."""
+        parent = {}
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+        for ip in self._nodes:
+            parent[ip] = ip
+        for (a, b) in self._edges:
+            if a in parent and b in parent:
+                union(a, b)
+        clusters: dict[str, set] = {}
+        ip_root: dict[str, str] = {}
+        for ip in self._nodes:
+            root = find(ip)
+            ip_root[ip] = root
+            clusters.setdefault(root, set()).add(ip)
+        self._clusters = clusters
+        self._ip_root = ip_root
+        self._cluster_dirty = False
+
+    def clusters(self) -> list[set]:
+        """Return list of node-sets, each = one actor cluster."""
+        with self._lock:
+            if self._cluster_dirty:
+                self._rebuild_clusters()
+            return [set(s) for s in self._clusters.values() if len(s) >= 1]
+
+    def transitive_closure(self, max_hops: int = 3) -> list[dict]:
+        """P13.1: for every pair of nodes connected by a path of <=max_hops
+        edges but NOT directly linked, emit an inferred link with
+        confidence = product of decayed edge confidences along the
+        shortest-confidence-product path. Returns
+        [{ip_a, ip_b, conf, path, hops}]."""
+        with self._lock:
+            now = time.time()
+            adj: dict[str, list] = {}
+            for (a, b), e in self._edges.items():
+                age = (now - e['ts']) / 86400.0
+                ec = e['conf'] * math.exp(-age / 30.0)
+                if ec <= 0.01:
+                    continue
+                adj.setdefault(a, []).append((b, ec, e))
+                adj.setdefault(b, []).append((a, ec, e))
+            inferred = []
+            seen_pairs = set(self._edges.keys())
+            for src in adj:
+                # BFS by best product-confidence, bounded hops.
+                # deque: list.pop(0) is O(n) — O(frontier²) on wide graphs.
+                frontier = deque([(src, 1.0, [src])])
+                best: dict[str, tuple] = {}
+                while frontier:
+                    node, prod, path = frontier.popleft()
+                    if len(path) - 1 >= max_hops:
+                        continue
+                    for nxt, ec, _e in adj.get(node, []):
+                        if nxt == src or nxt in path:
+                            continue
+                        np_ = prod * ec
+                        npath = path + [nxt]
+                        cur = best.get(nxt)
+                        if cur is not None and cur[0] >= np_:
+                            continue
+                        best[nxt] = (np_, npath)
+                        frontier.append((nxt, np_, npath))
+                for dst, (conf, path) in best.items():
+                    if len(path) < 3:  # need >=2 hops to be 'inferred'
+                        continue
+                    # P13.1 contract: emit an inferred link only for pairs
+                    # NOT already directly linked — otherwise a real edge
+                    # gets a weaker, redundant 'inferred' shadow edge and a
+                    # spurious deduction row.
+                    dk = (src, dst) if src < dst else (dst, src)
+                    if dk in seen_pairs:
+                        continue
+                    inferred.append({'ip_a': src, 'ip_b': dst,
+                                     'conf': conf, 'path': path,
+                                     'hops': len(path) - 1})
+            # dedupe (each pair found twice, once per direction)
+            uniq = {}
+            for r in inferred:
+                k = (r['ip_a'], r['ip_b']) if r['ip_a'] < r['ip_b'] else (r['ip_b'], r['ip_a'])
+                if k not in uniq or r['conf'] > uniq[k]['conf']:
+                    uniq[k] = r
+            return sorted(uniq.values(), key=lambda r: -r['conf'])
+
+    def edge_between(self, ip_a: str, ip_b: str) -> dict | None:
+        key = (ip_a, ip_b) if ip_a < ip_b else (ip_b, ip_a)
+        with self._lock:
+            e = self._edges.get(key)
+            return dict(e) if e else None
+
+    def edges_snapshot(self) -> dict:
+        with self._lock:
+            return {k: dict(v) for k, v in self._edges.items()}
+
+    def nodes_snapshot(self) -> dict:
+        with self._lock:
+            return {k: dict(v) for k, v in self._nodes.items()}
+
+    def cluster_edges_sig(self, ips: set) -> int:
+        """P13.5: hash of the cluster's edge set — re-infer only on change.
+        Scans the cluster's incident edges only (adjacency index), not the
+        whole graph."""
+        h = 0
+        with self._lock:
+            keys = set()
+            for ip in ips:
+                keys.update(self._adj.get(ip) or ())
+            # sorted for a deterministic sig regardless of set order
+            for key in sorted(keys):
+                a, b = key
+                if a in ips and b in ips:
+                    e = self._edges[key]
+                    h = (h * 31 + hash((a, b, e['kind'], int(e['ts'])))) & 0x7fffffff
+        return h
+
+    def edges_hash(self) -> str:
+        """P10: content hash of the whole edge set — a cheap 'did anything
+        change' for reasoner/UI diffing."""
+        h = hashlib.sha256()
+        with self._lock:
+            for (a, b), e in sorted(self._edges.items()):
+                h.update(f"{a}|{b}|{e['kind']}|{e['conf']:.3f}|{int(e['ts'])}"
+                         .encode())
+        return h.hexdigest()[:16]
+
+    def edge_version(self) -> int:
+        """P13.5: monotonically increasing write counter — reasoners can
+        skip a pass entirely when it hasn't moved."""
+        with self._lock:
+            return self._version
+
+    def infer_location(self, ips: set, prefer_residential: bool = True) -> dict:
+        """P10.2/P13.2: resolve a cluster's true location from node
+        mv_detail — prefer the residential node (the unmasked endpoint)
+        over VPN/hosting exits; surface CONTRADICTIONs when verified
+        nodes disagree on country."""
+        with self._lock:
+            cands = []
+            for ip in ips:
+                nd = self._nodes.get(ip, {})
+                md = nd.get('mv_detail', {}) or {}
+                kind = ''
+                for k in ('provider_kind', 'kind'):
+                    if md.get(k):
+                        kind = str(md[k])
+                        break
+                cc = md.get('cc', '') or md.get('country_code', '')
+                city = md.get('city', '') or md.get('consensus_city', '')
+                geo = md.get('geo_fused') or {}
+                if not city and isinstance(geo, dict):
+                    city = geo.get('city', '')
+                for src in ('edge', 'bgp', 'fused'):
+                    d = md.get(src)
+                    if isinstance(d, dict):
+                        cc = cc or d.get('cc', '') or d.get('country', '')
+                        city = city or d.get('city', '')
+                if cc or city:
+                    w = 3 if kind in ('residential', 'isp', '') else 1
+                    cands.append({'ip': ip, 'cc': cc, 'city': city,
+                                  'kind': kind, 'w': w})
+            if not cands:
+                return {'cc': '', 'city': '', 'ip': '', 'conflicts': []}
+            votes: dict[str, float] = {}
+            by_loc: dict[str, dict] = {}
+            for c in cands:
+                key = c['cc'] or c['city']
+                votes[key] = votes.get(key, 0.0) + c['w']
+                by_loc.setdefault(key, c)
+            winner = max(votes, key=votes.get)
+            conflicts = [k for k in votes if k != winner]
+            res = dict(by_loc[winner])
+            res['conflicts'] = conflicts
+            # prefer the residential node inside the winning location
+            if prefer_residential:
+                for c in cands:
+                    if (c['cc'] or c['city']) == winner and c['kind'] in ('residential', 'isp', ''):
+                        res = dict(c)
+                        res['conflicts'] = conflicts
+                        break
+            return res
+
+    def update_beliefs(self, ips: set) -> dict:
+        """P13.2: Bayesian belief propagation. Each node maintains a
+        belief dict {cc: score} accumulated from every incident edge —
+        an edge to a verified neighbor contributes
+        decayed_conf * neighbor_weight to the neighbor's claimed country.
+        A node's own verified geo contributes at weight w too.
+
+        Returns {ip: {'winner': cc, 'beliefs': {cc: score},
+                     'conflicts': [(cc_a, cc_b)], 'winner_ts': ts}}
+        where conflicts lists the cc pairs that tied within 10% — the
+        tie is broken in favour of the more-recently-verified edge."""
+        now = time.time()
+        out: dict[str, dict] = {}
+        with self._lock:
+            for ip in ips:
+                beliefs: dict[str, float] = {}
+                belief_ts: dict[str, float] = {}
+                # node's own geo claim — stamped with the node's last-
+                # observed time, NOT now(): a fresh timestamp would win
+                # every recency tie-break by construction rather than
+                # by evidence recency.
+                _nd = self._nodes.get(ip) or {}
+                md = _nd.get('mv_detail', {}) or {}
+                own_cc = md.get('cc', '') or md.get('country_code', '')
+                own_kind = str(md.get('provider_kind') or md.get('kind') or '')
+                if own_cc:
+                    w = 3 if own_kind in ('residential', 'isp', '') else 1
+                    beliefs[own_cc] = beliefs.get(own_cc, 0.0) + 0.9 * w
+                    belief_ts[own_cc] = _nd.get('last', now)
+                # each incident edge: neighbor's claim weighted by the
+                # decayed edge confidence and the neighbor's kind weight.
+                # Adjacency index → O(degree), not O(edges).
+                for (a, b) in self._adj.get(ip, ()):
+                    e = self._edges.get((a, b))
+                    if e is None:
+                        continue
+                    peer = b if ip == a else a
+                    pmd = (self._nodes.get(peer) or {}).get('mv_detail', {}) or {}
+                    pcc = pmd.get('cc', '') or pmd.get('country_code', '')
+                    if not pcc:
+                        continue
+                    pkind = str(pmd.get('provider_kind') or pmd.get('kind') or '')
+                    w = 3 if pkind in ('residential', 'isp', '') else 1
+                    age_days = (now - e['ts']) / 86400.0
+                    contrib = e['conf'] * math.exp(-age_days / 30.0) * w
+                    beliefs[pcc] = beliefs.get(pcc, 0.0) + contrib
+                    if e['ts'] > belief_ts.get(pcc, 0.0):
+                        belief_ts[pcc] = e['ts']
+                if not beliefs:
+                    continue
+                ranked = sorted(beliefs.items(), key=lambda kv: -kv[1])
+                winner_cc, winner_s = ranked[0]
+                conflicts = []
+                for cc, s in ranked[1:]:
+                    if s >= winner_s * 0.9:
+                        conflicts.append(cc)
+                        # tie-break: more recently verified edge wins
+                        if belief_ts.get(cc, 0) > belief_ts.get(winner_cc, 0):
+                            winner_cc, winner_s = cc, s
+                    else:
+                        break
+                out[ip] = {'winner': winner_cc,
+                           'beliefs': {k: round(v, 3)
+                                       for k, v in beliefs.items()},
+                           'conflicts': conflicts,
+                           'winner_ts': belief_ts.get(winner_cc, 0.0)}
+        return out
+
+    def cluster_for(self, ip: str) -> set | None:
+        """Return the cluster containing ip, or None. O(1) via _ip_root."""
+        with self._lock:
+            if self._cluster_dirty:
+                self._rebuild_clusters()
+            s = self._clusters.get(self._ip_root.get(ip))
+            return set(s) if s else None
+
+    def edges_for(self, ip: str) -> list[dict]:
+        """Return all edges touching ip, with temporal decay applied.
+        O(degree) via the adjacency index, not O(edges)."""
+        now = time.time()
+        out = []
+        with self._lock:
+            for (a, b) in self._adj.get(ip, ()):
+                e = self._edges.get((a, b))
+                if e is None:
+                    continue
+                age_days = (now - e['ts']) / 86400.0
+                decay = math.exp(-age_days / 30.0)
+                out.append({
+                    'peer': b if ip == a else a,
+                    'kind': e['kind'], 'conf': e['conf'] * decay,
+                    'source': e['source'], 'ts': e['ts'], 'age_days': age_days,
+                })
+        return out
+
+    def cluster_confidence(self, ips: set) -> dict:
+        """Fuse all intra-cluster edges into a cluster-level confidence.
+        Uses Noisy-OR for identity links (independent evidence combines):
+        P(same actor) = 1 - product(1 - conf_i).
+        Returns {conf, n_edges, n_methods, edges: list}."""
+        now = time.time()
+        edge_confs = []
+        edge_kinds = set()
+        method_best: dict[str, float] = {}
+        with self._lock:
+            keys = set()
+            for ip in ips:
+                keys.update(self._adj.get(ip) or ())
+            for (a, b) in keys:
+                if a not in ips or b not in ips:
+                    continue
+                e = self._edges[(a, b)]
+                age_days = (now - e['ts']) / 86400.0
+                decay = math.exp(-age_days / 30.0)
+                ec = e['conf'] * decay
+                edge_confs.append(ec)
+                for k in (e.get('kinds') or {e['kind']}):
+                    edge_kinds.add(k)
+                    if ec > method_best.get(k, 0.0):
+                        method_best[k] = ec
+        n = len(edge_confs)
+        if not edge_confs:
+            return {'conf': 0.0, 'n_edges': 0, 'n_methods': 0, 'edges': []}
+        # Noisy-OR: independent evidence combines
+        prod = 1.0
+        for c in edge_confs:
+            prod *= (1.0 - c)
+        conf = min(0.99, 1.0 - prod)  # never claim 1.0 (§2 hard floor)
+        # Fragility: how much conf drops if strongest edge removed
+        if len(edge_confs) > 1:
+            max_c = max(edge_confs)
+            prod_without = prod / (1.0 - max_c) if max_c < 1.0 else 0.0
+            conf_without = 1.0 - prod_without
+            fragility = conf - conf_without
+        else:
+            fragility = conf  # single edge = max fragility
+        # P32: uncertainty quantification — second-order stats.
+        # Spec: uncertainty is a composite conf_variance / n_methods,
+        # where conf_variance is the variance of the per-METHOD
+        # confidences (the agreement among independent methods), not the
+        # raw edge list. One strong method + one weak = fragile.
+        method_confs = list(method_best.values())
+        n_methods = len(method_confs)
+        mean_c = sum(method_confs) / n_methods
+        conf_variance = sum((c - mean_c) ** 2 for c in method_confs) / n_methods
+        uncertainty = conf_variance / n_methods
+        robust = (n_methods >= 3 and fragility < 0.15 and uncertainty < 0.01)
+        return {
+            'conf': conf, 'n_edges': n, 'n_methods': len(edge_kinds),
+            'fragility': fragility, 'edges': edge_confs,
+            'conf_variance': round(conf_variance, 4),
+            'uncertainty': round(uncertainty, 4),
+            'robust': robust,
+        }
+
+    def snapshot(self) -> dict:
+        """Thread-safe snapshot for UI/export."""
+        with self._lock:
+            return {
+                'nodes': len(self._nodes),
+                'edges': len(self._edges),
+                'clusters': len(self._clusters) if not self._cluster_dirty else None,
+            }
+
+
+# ========================== P13: TRANSITIVE INFERENCE ==========================
+# Reasoner over the EvidenceGraph: turns single-hop clusters into multi-hop
+# actor inferences with honest confidence. Runs on the 60s timer. Produces
+# Deduction rows that cite the edge chain so the analyst sees the reasoning.
+#
+# Why it works: the chain rule of probability under independence — if A~B
+# at 0.8 and B~C at 0.7, then A~C transitively at 0.56 (product). Edges
+# that share no path don't combine. Temporal decay (P10's 30-day half-life)
+# is already applied at read time, so stale transitive chains weaken
+# naturally. Contradictions (two paths to the same node with different
+# location evidence) are surfaced, not silently resolved.
+class GraphReasoner:
+    __slots__ = ('_graph', '_last_run', '_deductions', '_lock',
+                 '_seen_inferred', '_seen_sig', '_seen_flag', '_adv_prev',
+                 '_dossier_done', '_pending', '_fed_sigs', '_conn_idx')
+
+    def __init__(self, graph: 'EvidenceGraph'):
+        self._graph = graph
+        self._last_run = 0.0
+        self._deductions: list = []
+        self._lock = threading.Lock()
+        self._seen_inferred: set = set()    # dedupe: inferred pairs already emitted
+        self._seen_sig: dict = {}           # cluster_key -> edges_hash (P13.5)
+        self._seen_flag: set = set()        # dedupe: one-shot event keys
+        self._adv_prev: dict = {}           # cluster_key -> last sophistication label
+        self._dossier_done: set = set()     # P17: component keys with a dossier
+        self._pending: list = []            # (cat, sev, msg, evidence, score) for monitor dispatch
+        # Producer-feed signatures — re-writing an edge with a fresh ts
+        # every 60s pass would keep stale evidence permanently young,
+        # defeating the 30-day decay. Edges re-add only when the source
+        # record actually moved (new ips or a newer last-observed).
+        self._fed_sigs: dict = {}
+        # ip -> [ConnectionEntry] index, rebuilt once per reasoner pass;
+        # _backfill_geo/_write_node_md/_feed_flow_shapes all scanned
+        # connections.values() per IP before (O(nodes x conns)).
+        self._conn_idx: dict = {}
+
+    def _dedupe(self, key: str, cap: int = 20000) -> bool:
+        """Bounded dedupe — True when key is new (records it)."""
+        if key in self._seen_flag:
+            return False
+        self._seen_flag.add(key)
+        if len(self._seen_flag) > cap:
+            for k in list(self._seen_flag)[:cap // 4]:
+                self._seen_flag.discard(k)
+        return True
+
+    def run(self, monitor=None) -> list:
+        """Run one inference pass. Returns list of Deduction objects.
+        Idempotent within a 60s window (skips if already ran recently).
+        The 60s orchestrator: sense→fuse→link→reason→calibrate→act (§8.10)."""
+        now = time.time()
+        if now - self._last_run < 55.0:
+            return self._deductions
+        self._last_run = now
+        # P16: auto-adjust method weights from observed outcomes
+        _thr_events = []
+        try:
+            _outcome_tracker.adjust_weights()
+            _thr_events = _outcome_tracker.adjust_thresholds()
+            # P27: where measured calibration is available, override with it
+            _calibration.apply_to_weights()
+        except Exception:
+            pass
+        deductions = []
+
+        def _emit(cat, sev, msg, evidence, score, proc='', pid=0):
+            deductions.append(Deduction(
+                timestamp=now, severity=sev, category=cat,
+                process_name=proc, pid=pid, message=msg,
+                evidence=list(evidence), score=score))
+
+        for _te in _thr_events:
+            _emit('THRESHOLD_ADJUSTED', 'LOW',
+                  f"method {_te['method']} weight {_te['old']}→{_te['new']} "
+                  f"(precision {_te['precision']}, n={_te['n']})",
+                  [f"method: {_te['method']}",
+                   f"precision: {_te['precision']}",
+                   f"samples: {_te['n']}",
+                   f"weight: {_te['old']} → {_te['new']}"], 0.5)
+
+        try:
+            g = self._graph
+            # ---------- LINK: feed every producer's links into the graph ----------
+            try:
+                self._feed_producers(monitor, now)
+            except Exception:
+                pass
+            # ---------- REASON: transitive inference (P13.1) ----------
+            try:
+                for inf in g.transitive_closure(3):
+                    key = tuple(sorted((inf['ip_a'], inf['ip_b'])))
+                    if key in self._seen_inferred:
+                        continue
+                    self._seen_inferred.add(key)
+                    if len(self._seen_inferred) > 50000:
+                        for _k in list(self._seen_inferred)[:10000]:
+                            self._seen_inferred.discard(_k)
+                    # P13.4: the deduction row carries the full chain —
+                    # per-edge kinds, base + decayed confidences, and the
+                    # resolved location of the terminal node.
+                    comp_edges = []
+                    for _pi in range(len(inf['path']) - 1):
+                        _pe = g.edge_between(inf['path'][_pi],
+                                             inf['path'][_pi + 1]) or {}
+                        _pbase = _pe.get('conf', 0.0)
+                        _page = (now - _pe.get('ts', now)) / 86400.0
+                        comp_edges.append({
+                            'a': inf['path'][_pi], 'b': inf['path'][_pi + 1],
+                            'kind': _pe.get('kind', '?'), 'conf': _pbase,
+                            'age_days': round(_page, 2),
+                            'decayed_conf': round(
+                                _pbase * math.exp(-_page / 30.0), 4)})
+                    _loc = g.infer_location({inf['ip_b']})
+                    deductions.append(Deduction.feed_graph_inference({
+                        'category': 'ACTOR_CLUSTER_INFERRED',
+                        'path': inf['path'], 'edges': comp_edges,
+                        'conf': inf['conf'], 'hops': inf['hops'],
+                        'location': {'cc': _loc.get('cc', ''),
+                                     'city': _loc.get('city', '')}}))
+                    g.add_edge(inf['ip_a'], inf['ip_b'], 'inferred',
+                               inf['conf'], 'P13-transitive', method='transitive')
+            except Exception:
+                pass
+            # ---------- REASON: actor clusters (P10.2/P13.5) ----------
+            clusters = g.clusters()
+            for cluster in clusters:
+                if len(cluster) < 2:
+                    continue
+                ckey = ','.join(sorted(cluster))
+                sig = g.cluster_edges_sig(cluster)
+                if self._seen_sig.get(ckey) == sig:
+                    continue  # P13.5: unchanged component → no re-inference
+                self._seen_sig[ckey] = sig
+                if len(self._seen_sig) > 10000:
+                    for _k in list(self._seen_sig)[:2000]:
+                        self._seen_sig.pop(_k, None)
+                ci = g.cluster_confidence(cluster)
+                conf, fragility = ci['conf'], ci.get('fragility', 0)
+                unc = ci.get('uncertainty', 0)
+                robust = ci.get('robust', False)
+                loc = g.infer_location(cluster)
+                # P13.2: belief propagation — each node's {cc: score} from
+                # every incident edge; tied claims → CONTRADICTION with
+                # both sources; winner backfills ConnectionEntry with
+                # geo_source 'MV-GRAPH-INFERRED'.
+                try:
+                    for bip, bel in g.update_beliefs(cluster).items():
+                        if bel['conflicts'] and self._dedupe(
+                                f"belief:{bip}:{bel['winner']}"):
+                            _emit('CONTRADICTION', 'MEDIUM',
+                                  f"{bip}: geo beliefs disagree — "
+                                  f"{bel['winner']} wins over "
+                                  f"{', '.join(bel['conflicts'][:3])} "
+                                  f"(recent-verified tie-break)",
+                                  [f"beliefs: {bel['beliefs']}",
+                                   f"winner: {bel['winner']}",
+                                   f"losers: {bel['conflicts'][:3]}"],
+                                  conf)
+                        self._backfill_geo(monitor, bip, bel['winner'])
+                except Exception:
+                    pass
+                true_loc = f"{loc.get('city') or loc.get('cc') or 'unknown'}"
+                primary = loc.get('ip') or max(
+                    cluster, key=lambda ip: len(g.edges_for(ip)))
+                ips_str = ', '.join(sorted(cluster)[:5])
+                if len(cluster) > 5:
+                    ips_str += f' +{len(cluster) - 5}'
+                tag = 'robust' if robust else 'fragile'
+                msg = (f"ACTOR_CLUSTER {ips_str}: confidence={conf:.2f} "
+                       f"± {unc:.3f} ({tag}, {ci['n_methods']} methods, "
+                       f"fragility={fragility:.2f}) true_location={true_loc}")
+                evidence = []
+                for ip in sorted(cluster)[:5]:
+                    for e in g.edges_for(ip)[:3]:
+                        evidence.append(
+                            f"{ip}—{e['kind']}→{e['peer']} ({e['conf']:.2f})")
+                if loc.get('conflicts'):
+                    evidence.append('CONTRADICTION: ' + '; '.join(
+                        f"{c}" for c in loc['conflicts'][:3]))
+                    _emit('CONTRADICTION', 'MEDIUM',
+                          f"location conflict in cluster {ips_str}: "
+                          f"resolved {true_loc} over {loc['conflicts'][:2]}",
+                          evidence, conf)
+                sev = 'LOW' if conf < 0.5 else ('MEDIUM' if conf < 0.8 else 'HIGH')
+                _emit('ACTOR_CLUSTER', sev, msg, evidence, conf)
+                # P32.1: second-order stats onto the primary node's mv_detail
+                self._write_node_md(primary, 'confidence_quality', {
+                    'conf': conf, 'uncertainty': unc,
+                    'conf_variance': ci.get('conf_variance', 0),
+                    'n_methods': ci['n_methods'], 'fragility': fragility,
+                    'robust': robust})
+                # P19.2: federated prior feeds cluster confidence
+                try:
+                    fed = _reputation.federated_conf(primary)
+                    if fed and fed > conf:
+                        _emit('FEDERATED_RAISE', 'LOW',
+                              f"federated record raises {primary} "
+                              f"{conf:.2f}→{fed:.2f}", evidence, fed)
+                except Exception:
+                    pass
+                # P24: adversary sophistication + strategy adaptation
+                adv_level = 0
+                try:
+                    adv_level = _adversary_model.level(ckey)
+                    soph = {0: 'LOW', 1: 'LOW', 2: 'MEDIUM', 3: 'HIGH'}[adv_level]
+                    prev = self._adv_prev.get(ckey, 'LOW')
+                    self._adv_prev[ckey] = soph
+                    if soph != prev:
+                        _emit('ADVERSARY_ADAPTATION', 'WARNING',
+                              f"cluster {ips_str} sophistication {prev}→{soph}: "
+                              f"techniques={sorted(_adversary_model.techniques(ckey))}",
+                              evidence, conf)
+                        if soph != 'LOW':
+                            for ip in cluster:
+                                _active_prober.enqueue(ip, 443, 'tls_cert', ckey)
+                    thr = {'LOW': 0.85, 'MEDIUM': 0.75, 'HIGH': 0.90}[soph]
+                except Exception:
+                    thr = 0.85
+                # P30: lifecycle phase classification + transitions
+                try:
+                    phase = _lifecycle_tracker.classify(
+                        self._cluster_flow_stats(monitor, cluster))
+                    prev_phase = _lifecycle_tracker.record_phase(ckey, phase)
+                    if prev_phase and prev_phase != phase:
+                        _emit('CLUSTER_PHASE_TRANSITION', 'LOW',
+                              f"cluster {ips_str} phase {prev_phase}→{phase}",
+                              evidence, conf)
+                        if prev_phase == 'dormant' and phase == 'recon':
+                            _emit('ADVERSARY_CAMPAIGN_RESTART', 'HIGH',
+                                  f"dormant cluster {ips_str} re-entered recon",
+                                  evidence, conf)
+                    self._write_node_md(primary, 'lifecycle', {
+                        'phase': phase,
+                        'history': _lifecycle_tracker.phase_history(ckey)})
+                except Exception:
+                    pass
+                # P40: convergence rule — stop probing when gain is tiny
+                try:
+                    if not _chess_kernel.should_probe(ckey, conf, unc):
+                        continue  # converged — skip act/gather for this cluster
+                except Exception:
+                    pass
+                # P32.2/P17: actionability gate → dossier or probes
+                try:
+                    if conf >= thr and unc < 0.01 and robust:
+                        if ckey not in self._dossier_done:
+                            dossier = _dossier_gen.generate_cluster(
+                                ckey, cluster, g, primary, loc,
+                                phase_hist=_lifecycle_tracker.phase_history(ckey))
+                            if dossier:
+                                self._dossier_done.add(ckey)
+                                if len(self._dossier_done) > 5000:
+                                    for _k in list(self._dossier_done)[:1000]:
+                                        self._dossier_done.discard(_k)
+                                _emit('DOSSIER_READY', 'CRITICAL',
+                                      f"dossier ready for {primary}: "
+                                      f"conf={conf:.2f} ± {unc:.3f} "
+                                      f"({ci['n_methods']} methods)",
+                                      dossier.get('evidence_chain', evidence),
+                                      conf)
+                                try:
+                                    GNAT.record('dossier', dossier)
+                                except Exception:
+                                    pass
+                    elif conf >= 0.5 and unc >= 0.01:
+                        # fragile — gather more evidence (P18 probes)
+                        for ip in list(cluster)[:4]:
+                            _active_prober.enqueue(ip, 443, 'tls_cert', ckey)
+                except Exception:
+                    pass
+            # ---------- REASON: fingerprint diversity (P21) ----------
+            try:
+                for ip, n, window in _fp_diversity.flagged():
+                    k = f"fpr:{ip}"
+                    if self._dedupe(k):
+                        _emit('FINGERPRINT_RANDOMIZATION', 'WARNING',
+                              f"{ip} emitted {n} distinct fingerprints "
+                              f"in {window:.0f}s — evading P0 correlation",
+                              [f"distinct_fps={n}", f"window_s={window:.0f}"],
+                              0.7)
+                        _adversary_model.observe(ip, 'fingerprint_randomization')
+                    # P21.2: the flagged client inside an actor cluster →
+                    # the whole cluster is evading fingerprinting
+                    try:
+                        cl = g.cluster_for(ip)
+                        if cl and len(cl) >= 2:
+                            for _peer in sorted(cl - {ip})[:2]:
+                                g.add_edge(ip, _peer,
+                                           'fingerprint_randomization',
+                                           0.6, 'fp-diversity',
+                                           method='fp_randomization')
+                            ck = f"evfp:{','.join(sorted(cl))}"
+                            if self._dedupe(ck):
+                                _emit('EVADING_FINGERPRINTING', 'HIGH',
+                                      f"cluster {sorted(cl)[:4]} rotates "
+                                      f"fingerprints — evasion at actor "
+                                      f"level, not just endpoint",
+                                      [f"member: {ip}",
+                                       f"cluster: {sorted(cl)[:8]}",
+                                       f"distinct_fps: {n}"], 0.8)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # ---------- P16.1: outcomes from ground-truth confirmations ----
+            try:
+                self._feed_outcomes()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        with self._lock:
+            self._deductions = deductions
+        return deductions
+
+    _ADV_LABEL = {0: 'LOW', 1: 'LOW', 2: 'MEDIUM', 3: 'HIGH'}
+
+    def _cluster_flow_stats(self, monitor, cluster: set) -> dict:
+        """Summarize a cluster's recent flow profile for P30 phase
+        classification: {short_conns, diverse_ips, sustained_bytes, outbound}."""
+        stats = {'short_conns': 0, 'diverse_ips': len(cluster),
+                 'sustained_bytes': 0, 'outbound': 0, 'keepalive_only': True}
+        try:
+            hist = []
+            ch = getattr(monitor, 'conn_history', None) if monitor else None
+            if ch is not None:
+                hist = ch.get_history()
+            for h in hist[-5000:]:
+                rip = h.get('remote_ip', '')
+                if rip not in cluster:
+                    continue
+                dur = h.get('duration') or 0
+                stats['keepalive_only'] = False
+                if dur < 30:
+                    stats['short_conns'] += 1
+        except Exception:
+            pass
+        try:
+            bw = getattr(monitor, 'conn_history', None)
+            if bw is not None:
+                bwd = bw.get_bandwidth() or {}
+                for ip in cluster:
+                    b = bwd.get(ip) or {}
+                    if (b.get('bytes_sent') or 0) > 5_000_000:
+                        stats['sustained_bytes'] += b['bytes_sent']
+                        stats['outbound'] += 1
+                        stats['keepalive_only'] = False
+        except Exception:
+            pass
+        return stats
+
+    def _build_conn_idx(self, monitor) -> None:
+        """Rebuild the ip -> [entries] index once per reasoner pass."""
+        idx = {}
+        try:
+            ci = getattr(monitor, 'conn_inventory', None) if monitor else None
+            for e in getattr(ci, 'connections', {}).values():
+                rip = getattr(e, 'remote_ip', '')
+                if rip:
+                    idx.setdefault(rip, []).append(e)
+        except Exception:
+            pass
+        self._conn_idx = idx
+
+    def _backfill_geo(self, monitor, ip: str, cc: str) -> None:
+        """P13.2: write the graph-inferred country onto live
+        ConnectionEntries for ip — only where the entry has no verified
+        cc, and tag geo_source 'MV-GRAPH-INFERRED' so the origin of the
+        claim is visible in the Inspector."""
+        if not cc or monitor is None:
+            return
+        try:
+            for e in self._conn_idx.get(ip, ()):
+                cur = (getattr(e, 'country_code', '') or '').strip()
+                if cur and cur != '??':
+                    continue
+                e.country_code = cc
+                gs = (getattr(e, 'geo_source', '') or '')
+                if 'MV-GRAPH-INFERRED' not in gs:
+                    e.geo_source = gs + ('+' if gs else '') + 'MV-GRAPH-INFERRED'
+        except Exception:
+            pass
+
+    def _write_node_md(self, ip: str, key: str, val) -> None:
+        """Write an mv_detail sub-key on the evidence-graph node AND on any
+        live ConnectionEntry for that IP (so the Inspector shows it)."""
+        try:
+            with self._graph._lock:
+                nd = self._graph._nodes.get(ip)
+                if nd is not None:
+                    nd.setdefault('mv_detail', {})[key] = val
+        except Exception:
+            pass
+        try:
+            for e in self._conn_idx.get(ip, ()):
+                e.mv_detail[key] = val
+        except Exception:
+            pass
+
+    def _feed_producers(self, monitor, now: float) -> None:
+        """LINK stage: pull every producer's new links into EvidenceGraph —
+        P0 fingerprints, P7 SA-links, P3 watermarks, P9 one-way pairs,
+        P15 behavior, P22 session-graph, P28 cross-protocol, P25 canary
+        relays, P5 cross-medium, federated records."""
+        g = self._graph
+        # Rebuild the connection index once for every consumer this pass.
+        self._build_conn_idx(monitor)
+        if len(self._fed_sigs) > 40000:
+            for _k in list(self._fed_sigs)[:10000]:
+                self._fed_sigs.pop(_k, None)
+        # P0.3/P0.4: multi-egress fingerprints → fp_match edges + events
+        try:
+            confirmed = set()
+            try:
+                rdb = PROVIDER_RANGES
+                for rec in SESSIONS.confirm_vpn_cluster(rdb):
+                    confirmed.add(rec['fp'])
+            except Exception:
+                pass
+            for rec in SESSIONS.alert_multi_egress():
+                ips = [i for i in rec['ips'] if _is_public_ip_cached(i)]
+                # Feed signature: only re-write the fp_match edges when the
+                # session record moved (new ip set or a newer last-seen
+                # bucket) — a static record re-fed every pass would pin the
+                # edge ts at now() forever and mask staleness from decay.
+                _fsig = ('fp', rec['fp'])
+                _fval = (tuple(sorted(ips)), int((rec.get('last') or now) // 300))
+                if self._fed_sigs.get(_fsig) != _fval:
+                    self._fed_sigs[_fsig] = _fval
+                    for i in range(len(ips)):
+                        for j in range(i + 1, len(ips)):
+                            g.add_edge(ips[i], ips[j], 'fp_match', 0.9,
+                                       'SessionRegistry',
+                                       ts=rec.get('last'), method='JA4Plus')
+                if len(ips) >= 2:
+                    conf_vpn = rec['fp'] in confirmed
+                    key = f"fpc:{rec['fp']}"
+                    if self._dedupe(key):
+                        # §8.8.K.7: the event payload carries the first
+                        # egress IP's collected mv_detail so downstream
+                        # SIEM receives the full evidence, not a summary.
+                        _fp_md = {}
+                        try:
+                            _nd = g._nodes.get(ips[0]) or {}
+                            _fp_md = dict(_nd.get('mv_detail') or {})
+                        except Exception:
+                            pass
+                        self._pending.append((
+                            'VPN_FP_CORRELATION',
+                            'CRITICAL' if conf_vpn else 'HIGH',
+                            f"Same client fingerprint seen from "
+                            f"{len(ips)} distinct public IPs"
+                            + (' (confirmed VPN)' if conf_vpn else ''),
+                            [f"fp: {rec['fp'][:12]}",
+                             f"ips: {', '.join(ips[:8])}",
+                             f"ua: {str(rec.get('ua', ''))[:80]}"],
+                            0.9, _fp_md))
+                        try:
+                            _outcome_tracker.record('fp_match', True)
+                        except Exception:
+                            pass
+                        try:
+                            _fp_diversity_note_cluster(ips)
+                        except Exception:
+                            pass
+                    try:
+                        dbm = getattr(monitor, 'db', None) if monitor else None
+                        if dbm is not None:
+                            dbm.save_client_fp([{
+                                'fp': rec['fp'], 'ip': ip,
+                                'ua': rec.get('ua', ''),
+                                'first': rec.get('first', now),
+                                'last': rec.get('last', now),
+                                'n': rec.get('n', 0),
+                                'confirmed_vpn': rec['fp'] in confirmed}
+                                for ip in ips])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # P7.3/P3: SA-link + watermark + flow-corr matches → edges
+        try:
+            for sa_id, rec in SALINK_GRAPH.items():
+                ips = [i for i in rec['ips'] if _is_public_ip_cached(i)]
+                _fsig = ('sa', sa_id)
+                _fval = (tuple(sorted(ips)), int(rec.get('last', 0) // 300))
+                if self._fed_sigs.get(_fsig) == _fval:
+                    continue
+                self._fed_sigs[_fsig] = _fval
+                for i in range(len(ips)):
+                    for j in range(i + 1, len(ips)):
+                        g.add_edge(ips[i], ips[j], 'sa_match', 0.8,
+                                   f'SALINK:{sa_id[:16]}',
+                                   ts=rec.get('last'), method='SALINK')
+        except Exception:
+            pass
+        try:
+            for m in FLOWCORR.matches[-200:]:
+                wmid = str(m.get('wm', ''))
+                for ip in _ips_in_text(wmid) + _ips_in_text(str(m.get('flow', ''))):
+                    peer = m.get('src', '')
+                    if _is_public_ip_cached(ip) and _is_public_ip_cached(peer):
+                        g.add_edge(ip, peer, 'watermark', 0.7,
+                                   'FlowCorrelator', method='watermark')
+        except Exception:
+            pass
+        # P9: one-way flow pairs
+        try:
+            for pair in _oneway_pairer.drain():
+                a, b = pair['out_ip'], pair['in_ip']
+                g.add_edge(a, b, 'oneway_pair', 0.85,
+                           'OneWayFlowPairer', method='oneway')
+                own = pair.get('owner') or {}
+                self._pending.append((
+                    'ONEWAY_PAIR', 'HIGH',
+                    f"one-way encrypted flow to {a} paired with return "
+                    f"traffic from {b} — {b} is the real return-path "
+                    f"endpoint",
+                    [f"out_flow: {pair['out_key']}",
+                     f"in_flow: {pair['in_key']}",
+                     f"pid: {own.get('pid', 0)}",
+                     f"exe_path: {own.get('exe', '')}",
+                     f"parent_name: {own.get('parent', '')}"],
+                    0.85))
+        except Exception:
+            pass
+        # P15: behavior fingerprint cross-IP matches
+        try:
+            for fp, ips in _behavior_registry.match_ips():
+                pl = [i for i in ips['ips'] if _is_public_ip_cached(i)]
+                _fsig = ('bf', fp)
+                _fval = (tuple(sorted(pl)), int(ips.get('last', 0) // 300))
+                _fresh = self._fed_sigs.get(_fsig) != _fval
+                if _fresh:
+                    self._fed_sigs[_fsig] = _fval
+                gap = abs(ips['last'] - ips['first'])
+                conf = 0.8 * math.exp(-gap / 86400.0 / 14.0)
+                for i in range(len(pl)):
+                    for j in range(i + 1, len(pl)):
+                        if _fresh:
+                            g.add_edge(pl[i], pl[j], 'temporal_behavior_match',
+                                       conf, f'behavior_fp:{fp[:8]}',
+                                       ts=ips.get('last'),
+                                       method='behavior_fp')
+                        key = f"tbm:{fp}:{pl[i]}:{pl[j]}"
+                        if self._dedupe(key):
+                            self._pending.append((
+                                'TEMPORAL_BEHAVIOR_MATCH', 'MEDIUM',
+                                f"same behavioral fingerprint on {pl[i]} "
+                                f"and {pl[j]} ({gap/86400:.1f}d apart)",
+                                [f"behavior_fp: {fp}",
+                                 f"ips: {pl[i]}, {pl[j]}",
+                                 f"conf: {conf:.2f}",
+                                 f"processes: {', '.join(sorted(ips['procs']))[:80]}"],
+                                conf))
+        except Exception:
+            pass
+        # P22: session-graph shape cross-IP matches
+        try:
+            for h, ips in _session_graph.match_ips():
+                pl = [i for i in ips['ips'] if _is_public_ip_cached(i)]
+                _fsig = ('sg', h)
+                _fval = (tuple(sorted(pl)), int(ips.get('last', 0) // 300))
+                if self._fed_sigs.get(_fsig) == _fval:
+                    continue
+                self._fed_sigs[_fsig] = _fval
+                for i in range(len(pl)):
+                    for j in range(i + 1, len(pl)):
+                        g.add_edge(pl[i], pl[j], 'session_graph_match',
+                                   0.75, f'session_graph:{h[:8]}',
+                                   ts=ips.get('last'),
+                                   method='session_graph')
+                        key = f"sgm:{h}:{pl[i]}:{pl[j]}"
+                        if self._dedupe(key):
+                            self._pending.append((
+                                'SESSION_GRAPH_MATCH', 'MEDIUM',
+                                f"same conversation shape on {pl[i]} "
+                                f"and {pl[j]}",
+                                [f"session_graph_hash: {h}",
+                                 f"ips: {pl[i]}, {pl[j]}", "conf: 0.75"],
+                                0.75))
+        except Exception:
+            pass
+        # P28: cross-protocol identity links (process-bound + behavioral)
+        try:
+            for a, b, conf, meta in _cross_protocol_links(monitor):
+                kind = ('cross_protocol' if conf >= 0.8
+                        else 'cross_protocol_behavior')
+                g.add_edge(a, b, kind, conf, meta, method=kind)
+                # K1: the same process (app id) reaching two IPs is also
+                # an app_id_match edge
+                if meta.startswith('process-bound:'):
+                    g.add_edge(a, b, 'app_id_match', 0.8,
+                               meta, method='app_id_match')
+                key = f"xpl:{a}:{b}"
+                if self._dedupe(key):
+                    self._pending.append((
+                        'CROSS_PROTOCOL_LINK', 'MEDIUM',
+                        f"{a}↔{b} same actor via {meta}",
+                        [f"ips: {a}, {b}", f"evidence: {meta}",
+                         f"conf: {conf}"], conf))
+        except Exception:
+            pass
+        # P25: canary breakthrough hits → canary_relay edges
+        try:
+            for h in CanaryRegistry.inst().hits[-100:]:
+                if not h.get('breakthrough'):
+                    continue
+                tok = h.get('token', '')
+                tgt = (CanaryRegistry.inst().tokens.get(tok) or {}).get('target', '')
+                ip = h.get('ip', '')
+                key = f"cr:{tok}:{ip}"
+                if tgt and ip and _is_public_ip_cached(ip) and \
+                        _is_public_ip_cached(tgt):
+                    # The hit is a one-time observation — add the edge
+                    # once (under the same dedupe), not every pass.
+                    if self._dedupe(key):
+                        g.add_edge(tgt, ip, 'canary_relay', 0.95,
+                                   'CanaryRegistry', method='canary')
+                        self._pending.append((
+                            'CANARY_RELAY_DETECTED', 'HIGH',
+                            f"canary {tok} sent to {tgt} re-emerged from "
+                            f"{ip} — {ip} is a relay on the path",
+                            [f"canary: {tok}", f"target: {tgt}",
+                             f"relay_ip: {ip}", "conf: 0.95"], 0.95))
+        except Exception:
+            pass
+        # P5: wireless-bypass + cross-medium reappearance
+        try:
+            if monitor is not None:
+                for ev in _spectrum_medium_events(monitor):
+                    key = f"med:{ev['category']}:{ev.get('address','')}"
+                    if not self._dedupe(key):
+                        continue
+                    self._pending.append((
+                        ev['category'], ev['severity'], ev['msg'],
+                        ev['evidence'], ev.get('conf', 0.5)))
+                    if ev['category'] == 'CROSS_MEDIUM_REAPPEARANCE':
+                        for peer in ev.get('peers', []):
+                            if _is_public_ip_cached(peer):
+                                g.add_edge(ev.get('address', ''), peer,
+                                           'cross_medium', 0.9, 'SpectrumHub',
+                                           method='cross_medium')
+        except Exception:
+            pass
+        # P14/P15/P22/P31/P9: flow-shape feed — behavior/session-graph/
+        # stegano/one-way/Welford all consume the same per-flow stats.
+        try:
+            self._feed_flow_shapes(monitor)
+        except Exception:
+            pass
+        # P19/P20: federated remote records → federated edges/contradictions
+        try:
+            for ip, rec in _reputation.pending_contradictions():
+                self._pending.append((
+                    'CONTRADICTION', 'MEDIUM',
+                    f"local verdict on {ip} contradicted by federated "
+                    f"record ({rec.get('kind','?')} conf={rec.get('conf',0):.2f}) "
+                    f"— federated wins",
+                    [f"ip: {ip}", f"federated: {rec}"], rec.get('conf', 0.5)))
+                md = {'provider_kind': rec.get('kind', ''),
+                      'cc': rec.get('cc', ''), 'city': rec.get('city', '')}
+                g.observe(ip, md)
+        except Exception:
+            pass
+
+    def _feed_flow_shapes(self, monitor) -> None:
+        """Consume monitor._flowstats — {remote_ip: {port: {ts, sz, out,
+        inn}}} — into every shape-keyed registry. Cheap per-packet writes
+        happen in the hot path; the expensive hashing runs here."""
+        fs = getattr(monitor, '_flowstats', None) if monitor else None
+        if not fs:
+            return
+        # Owner lookup rides the per-pass _conn_idx build (O(conns) once,
+        # not per flow).
+        owners = {}
+        for ip, entries in self._conn_idx.items():
+            if not entries:
+                continue
+            e = entries[0]
+            owners[ip] = {'pid': getattr(e, 'pid', 0),
+                          'exe': getattr(e, 'exe_path', '') or
+                                 getattr(e, 'process_name', ''),
+                          'parent': getattr(e, 'parent_name', '')}
+        dbm = getattr(monitor, 'db', None)
+        for ip, ports in list(fs.items()):
+            pub = _is_public_ip_cached(ip)
+            for port, fe in list(ports.items()):
+                ts = fe.get('ts') or []
+                if len(ts) < 4:
+                    continue
+                # Skip-unchanged: a flow with no new packets since the last
+                # pass needs no re-hashing/re-feeding. Count+last-ts is a
+                # cheap change signature.
+                _fskey = ('fs', ip, port)
+                _fsprev = self._fed_sigs.get(_fskey) or (0, 0)
+                _new_n = len(ts)
+                # ts freezes at 48 entries (hot-path cap) — the signature
+                # must track the packet counters too or the flow would
+                # stop feeding session-graph/Welford after its first 48.
+                _fsval = (_new_n, fe.get('out', 0) + fe.get('inn', 0))
+                if _fsprev == _fsval:
+                    continue
+                self._fed_sigs[_fskey] = _fsval
+                # Only the NEW timestamps since the previous pass — the
+                # stegano detector APPENDS observations, so re-feeding the
+                # whole last-24 window each pass would count every packet
+                # N times and poison the entropy/timing baseline.
+                _new_ts = (ts[-24:]
+                           if not _fsprev[0] or _fsprev[0] > _new_n
+                           else ts[_fsprev[0]:])
+                sizes = []
+                for s, c in (fe.get('sz') or {}).items():
+                    sizes.extend([s] * min(int(c), 8))
+                    if len(sizes) > 48:
+                        break
+                out, inn = fe.get('out', 0), fe.get('inn', 0)
+                n = out + inn or len(ts)
+                dirs = [1] * min(out, len(ts)) + [0] * min(inn, len(ts))
+                fkey = f"{ip}:{port}"
+                proc = (owners.get(ip) or {}).get('exe', '') if pub else ''
+                if pub:
+                    # P15.2 + P22.2: shape-keyed registries
+                    _behavior_registry.observe_flow(ip, ts, sizes, dirs,
+                                                    proc=proc)
+                    _session_graph.observe_flow(ip, ts, sizes, dirs)
+                # P9: one-way flows → pairer
+                if n >= 4 and (out / max(n, 1) >= 0.9 or inn / max(n, 1) >= 0.9):
+                    _oneway_pairer.observe(
+                        fkey, ip, 'out' if out >= inn else 'in',
+                        ts[-1], owner=owners.get(ip) or {})
+                # P31: within-flow steganography — feed sizes+times,
+                # delta only (see _new_ts above)
+                _new_sz = sizes[-len(_new_ts):] if sizes else []
+                for i, t in enumerate(_new_ts):
+                    _stegano_detector.observe(
+                        fkey, _new_sz[i] if i < len(_new_sz) else 0, t)
+                det = _stegano_detector.detect(fkey)
+                if det.get('score', 0) > 0.7:
+                    k = f'steg:{fkey}'
+                    if self._dedupe(k):
+                        self._pending.append((
+                            'STEGANO_SUSPECT', 'HIGH',
+                            f"flow {fkey} deviates from its own baseline "
+                            f"({det['reason']}) — possible covert channel",
+                            [f"flow: {fkey}", f"reason: {det['reason']}",
+                             f"score: {det['score']}",
+                             f"packets: {det['n_packets']}"], det['score']))
+                # P14: per-(proc,kind,feature) Welford models
+                gaps = [max(0.0, (ts[i + 1] - ts[i]) * 1000)
+                        for i in range(len(ts) - 1)]
+                if sizes and gaps:
+                    mean_sz = sum(sizes) / len(sizes)
+                    mean_gp = sum(gaps) / len(gaps)
+                    for feat, val in (('size', mean_sz), ('gap_ms', mean_gp)):
+                        mkey = f"{proc or 'unknown'}:{fe.get('_kind', 'flow')}:{feat}"
+                        wb = _welford_registry.get(mkey)
+                        if wb is None:
+                            wb = WelfordBaseline()
+                            _welford_registry[mkey] = wb
+                        z = wb.z_score(val)
+                        if wb.stats()['n'] >= 30 and abs(z) > _WELFORD_CLAMP:
+                            k = f'wdrift:{mkey}'
+                            if self._dedupe(k):
+                                self._pending.append((
+                                    'BEHAVIORAL_ANOMALY_DRIFT', 'MEDIUM',
+                                    f"flow {fkey} feature {feat}={val:.1f} "
+                                    f"is {abs(z):.1f}σ from {proc or 'unknown'} "
+                                    f"baseline — drift or spoof",
+                                    [f"feature: {feat}",
+                                     f"value: {val:.1f}",
+                                     f"z_score: {z:.2f} (clamped {_WELFORD_CLAMP}σ)",
+                                     f"model_n: {wb.stats()['n']}"], min(0.95, abs(z) / 10)))
+                        wb.update(val, clamp_sigma=_WELFORD_CLAMP)
+                        if dbm is not None and wb.stats()['n'] % 50 == 0:
+                            s = wb.stats()
+                            dbm.save_behavior_model(mkey, s['n'], s['mean'],
+                                                    s['variance'] * max(s['n'] - 1, 0))
+
+    def _feed_outcomes(self) -> None:
+        """P16.1: translate confirmations into method outcomes — ground-
+        truth links (P4) confirm fp_match; dossier feedback confirms/
+        falsifies every contributing method."""
+        try:
+            for fp, rec in SESSIONS.fp.items():
+                if not fp.startswith('groundtruth:'):
+                    continue
+                for _ip in rec['ips']:
+                    _outcome_tracker.record('fp_match', True)
+        except Exception:
+            pass
+
+    def deductions(self) -> list:
+        """Return cached deductions from the last run."""
+        with self._lock:
+            return list(self._deductions)
+
+
+# P7: Weighted fusion — replaces flat-vote in _fuse_location.
+# Each method gets a weight by reliability tier; weighted vote replaces
+# simple vote count. Structured conflicts are preserved, not dropped.
+_METHOD_WEIGHTS = {
+    # Tier 3 (strong, cryptographic / direct evidence) — weight 3
+    'GeoIP': 3, 'GeoIPalt': 3, 'RDAP': 3, 'RIPE': 3, 'Cymru': 3,
+    'EDGE': 3, 'GEOFEED': 3, 'TLS': 3, 'TLSALT': 3, 'IKE': 3, 'SSH': 3,
+    'BANNER': 3, 'H2FP': 3,
+    # Tier 2 (corroborating, path/timing) — weight 2
+    'RTT': 2, 'TCPRTT': 2, 'TSRTT': 2, 'HOPS': 2, 'PATH': 2, 'PEER': 2,
+    'SRVLOC': 2, 'RPKI': 2, 'rDNS': 2, 'PTRX': 2,
+    # Tier 1 (weak, heuristic) — weight 1
+    'TTL': 1, 'TTLX': 1, 'MSS': 1, 'PMTU': 1, 'TCPFP': 1, 'IPID': 1,
+    'TSCLK': 1, 'LAND': 1, 'TUNX': 1, 'PROX': 1, 'TOREXIT': 1,
+}
+
+def _weighted_vote(cc_votes: dict, methods: list) -> tuple[str, float, list]:
+    """Weighted country vote. Returns (winner_cc, confidence_0_100, conflicts).
+    confidence = weighted_agree / weighted_total * 100."""
+    weights = {m['name']: _METHOD_WEIGHTS.get(m['name'], 1) for m in methods if m.get('cc')}
+    weighted = {}
+    wtotal = 0.0
+    for cc, backers in cc_votes.items():
+        w = sum(weights.get(b, 1) for b in backers)
+        weighted[cc] = w
+        wtotal += w
+    if not wtotal:
+        return '', 0.0, []
+    winner = max(weighted, key=weighted.get)
+    conf = weighted[winner] / wtotal * 100.0
+    conflicts = []
+    for m in methods:
+        if not m.get('cc') or m['cc'] == winner:
+            continue
+        conflicts.append(f"{m['name']} says {m['cc']} vs consensus {winner}")
+    return winner, conf, conflicts
 
 
 # ========================== OUI LOOKUP ==========================
@@ -2675,6 +4004,1976 @@ _FALLBACK_OUI = {
     'F4F5D8': 'Google', '0017B0': 'Samsung', '0018F8': 'Linksys', '0023BE': 'Belkin',
     '001D0F': 'TP-Link', '0024D7': 'Xiaomi', '0019E3': 'Aruba', '0026BB': 'ARRIS',
 }
+
+
+# P10: module-level EvidenceGraph singleton — the deductive-chess board.
+# All cross-IP links from MultiVerifier, SessionRegistry, FlowCorrelator,
+# and future tactics feed edges into this graph. Clusters = actors.
+_evgraph = EvidenceGraph()
+
+# P13: module-level GraphReasoner singleton — the deductive-chess reasoner.
+# Runs on the 60s timer, produces Deduction rows from EvidenceGraph clusters.
+_graph_reasoner = GraphReasoner(_evgraph)
+
+
+# ========================== P16: CONFIDENCE-FEEDBACK CLOSED LOOP ==========================
+# Records alert outcomes (confirmed/falsified) and auto-adjusts method
+# weights in P7's _METHOD_WEIGHTS. A method with high false-positive rate
+# is auto-down-weighted; a method with high precision is auto-up-weighted.
+# This is the self-calibration lever: the system gets more accurate over
+# time without code changes.
+class OutcomeTracker:
+    __slots__ = ('_lock', '_outcomes', '_min_samples')
+
+    def __init__(self, min_samples: int = 10):
+        self._lock = threading.Lock()
+        self._outcomes: dict[str, dict] = {}  # method -> {tp, fp, n}
+        self._min_samples = min_samples
+
+    def record(self, method: str, confirmed: bool):
+        """Record an outcome: confirmed=True (TP) or confirmed=False (FP).
+        Persists to detection_outcomes so the estimate survives restart."""
+        if not method:
+            return
+        with self._lock:
+            o = self._outcomes.setdefault(method, {'tp': 0, 'fp': 0, 'n': 0})
+            o['tp' if confirmed else 'fp'] += 1
+            o['n'] += 1
+        try:
+            dbm = getattr(_ACTIVE_MONITOR, 'db', None) if _ACTIVE_MONITOR else None
+            if dbm is not None:
+                dbm.save_outcome(method, confirmed)
+        except Exception:
+            pass
+
+    def precision(self, method: str) -> float:
+        """Precision = tp / (tp + fp). Returns 0.5 if not enough samples."""
+        with self._lock:
+            o = self._outcomes.get(method)
+            if not o or o['n'] < self._min_samples:
+                return 0.5
+            return o['tp'] / max(1, o['tp'] + o['fp'])
+
+    def adjust_weights(self):
+        """Auto-adjust _METHOD_WEIGHTS based on observed precision.
+        effective_weight = base_weight * (0.5 + precision), floored at 0.5×base.
+        Only adjusts methods with enough samples."""
+        with self._lock:
+            for method, o in self._outcomes.items():
+                if o['n'] < self._min_samples:
+                    continue
+                prec = o['tp'] / max(1, o['tp'] + o['fp'])
+                base = _METHOD_WEIGHTS.get(method, 1)
+                effective = max(0.5, base * (0.5 + prec))
+                _METHOD_WEIGHTS[method] = round(effective, 2)
+
+    def adjust_thresholds(self) -> list:
+        """P16: raise/lower detection thresholds as precision drifts.
+        A method whose precision falls below 0.6 for >=20 outcomes gets its
+        confidence floor raised; one above 0.9 gets it lowered. Returns the
+        THRESHOLD_ADJUSTED events to emit."""
+        events = []
+        with self._lock:
+            for method, o in self._outcomes.items():
+                if o['n'] < 20:
+                    continue
+                prec = o['tp'] / max(1, o['tp'] + o['fp'])
+                cur = _METHOD_WEIGHTS.get(method, 1)
+                old = cur
+                if prec < 0.6:
+                    # false-positive-heavy → down-weight the method
+                    _METHOD_WEIGHTS[method] = round(max(0.5, cur - 0.05), 2)
+                elif prec > 0.9:
+                    _METHOD_WEIGHTS[method] = round(min(3.0, cur + 0.05), 2)
+                new = _METHOD_WEIGHTS[method]
+                if new != old:
+                    events.append({'method': method, 'old': old, 'new': new,
+                                   'precision': round(prec, 3), 'n': o['n']})
+        return events
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {m: dict(o) for m, o in self._outcomes.items()}
+
+_outcome_tracker = OutcomeTracker()
+
+
+# ========================== P27: CALIBRATION AGAINST GROUND TRUTH ==========================
+# A held-out set of known IPs with ground-truth labels. The system runs its
+# full pipeline on them and measures actual precision/recall per method.
+# The measured calibration replaces P16's sparse outcome estimate where
+# available — the honest answer to "how good are we actually."
+class CalibrationSet:
+    __slots__ = ('_lock', '_known', '_results')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # ip -> {true_cc, true_kind, true_org} — the ground truth
+        self._known: dict[str, dict] = {}
+        # method -> {tp, fp, fn, n, precision, recall} — measured
+        self._results: dict[str, dict] = {}
+        try:
+            self.load(CONFIG.get('attribution_calibration_file', 'calibration.json'))
+        except Exception:
+            pass
+
+    def run(self, verifier=None) -> dict:
+        """P27 CalibrationRun: evaluate against ground truth and persist."""
+        res = self.evaluate(verifier)
+        try:
+            dbm = getattr(_ACTIVE_MONITOR, 'db', None) if _ACTIVE_MONITOR else None
+            if dbm is not None and res.get('per_method'):
+                dbm.save_calibration(res)
+        except Exception:
+            pass
+        return res
+
+    def load(self, path: str):
+        """Load ground truth from a JSON file: {ip: {cc, kind, org}}."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            with self._lock:
+                self._known = {ip: v for ip, v in data.items()}
+        except Exception:
+            pass
+
+    def add(self, ip: str, cc: str = '', kind: str = '', org: str = ''):
+        """Add a single known IP with ground truth."""
+        with self._lock:
+            self._known[ip] = {'cc': cc.upper(), 'kind': kind, 'org': org}
+
+    def evaluate(self, verifier: 'MultiVerifier') -> dict:
+        """Run the full pipeline on every known IP and measure per-method
+        precision/recall. Returns {overall_accuracy, per_method: {...}}."""
+        if not self._known:
+            return {'overall_accuracy': 0, 'per_method': {}}
+        per_method: dict[str, dict] = {}
+        correct = 0
+        total = 0
+        for ip, truth in list(self._known.items()):
+            try:
+                rep = verifier.verify(ip) if verifier else {}
+            except Exception:
+                rep = {}
+            if not rep:
+                continue
+            total += 1
+            pred_cc = (rep.get('consensus_country') or '').upper()
+            if pred_cc == truth['cc']:
+                correct += 1
+            # Per-method evaluation
+            for m in rep.get('methods', []):
+                name = m.get('name', '')
+                mcc = (m.get('cc') or '').upper()
+                if not name or not mcc:
+                    continue
+                s = per_method.setdefault(name, {'tp': 0, 'fp': 0, 'fn': 0, 'n': 0})
+                s['n'] += 1
+                if mcc == truth['cc']:
+                    s['tp'] += 1
+                else:
+                    s['fp'] += 1
+            # False negatives: methods that didn't vote but should have
+            voted = {m.get('name') for m in rep.get('methods', []) if m.get('cc')}
+            for name in _METHOD_WEIGHTS:
+                if name not in voted:
+                    s = per_method.setdefault(name, {'tp': 0, 'fp': 0, 'fn': 0, 'n': 0})
+                    s['fn'] += 1
+        # Compute precision/recall per method
+        for name, s in per_method.items():
+            tp, fp, fn = s['tp'], s['fp'], s['fn']
+            s['precision'] = tp / max(1, tp + fp)
+            s['recall'] = tp / max(1, tp + fn)
+        accuracy = correct / max(1, total)
+        with self._lock:
+            self._results = per_method
+        return {'overall_accuracy': round(accuracy, 3), 'per_method': per_method}
+
+    def results(self) -> dict:
+        with self._lock:
+            return dict(self._results)
+
+    def apply_to_weights(self):
+        """Where measured precision is available, override P16's sparse
+        estimate with the measured value — the dense calibration replaces
+        the sparse outcome estimate."""
+        with self._lock:
+            for name, s in self._results.items():
+                if s.get('n', 0) < 5:
+                    continue
+                prec = s.get('precision', 0.5)
+                base = _METHOD_WEIGHTS.get(name, 1)
+                # Use measured precision directly (vs P16's running estimate)
+                effective = max(0.5, base * (0.5 + prec))
+                _METHOD_WEIGHTS[name] = round(effective, 2)
+
+_calibration = CalibrationSet()
+
+
+# ========================== P17: LEGAL DOSSIER ==========================
+# Packages evidence from GraphReasoner deductions + MultiVerifier reports
+# into a legal-process-ready dossier. Only generates when confidence is
+# high AND robust (P32) — the actionability gate. Never claims certainty
+# the evidence doesn't support.
+class DossierGenerator:
+    __slots__ = ('_min_conf', '_min_methods')
+
+    def __init__(self, min_conf: float = 0.85, min_methods: int = 3):
+        self._min_conf = min_conf
+        self._min_methods = min_methods
+
+    def generate(self, ip: str, deductions: list, mv_report: dict | None = None) -> dict | None:
+        """Generate a dossier for ip if it meets the actionability threshold.
+        Returns None if the evidence is too weak for legal escalation."""
+        # Find the deduction containing this IP
+        relevant = [d for d in deductions if ip in str(d.evidence) or ip in d.message]
+        if not relevant:
+            return None
+        d = relevant[0]
+        if d.score < self._min_conf:
+            return None
+        # Extract the cluster from the deduction
+        # Build the dossier
+        methods_used = set()
+        for ev in d.evidence:
+            # ev format: "ip—kind→peer (conf)"
+            if '—' in ev and '→' in ev:
+                kind = ev.split('—')[1].split('→')[0].strip()
+                methods_used.add(kind)
+        if len(methods_used) < self._min_methods:
+            return None
+        dossier = {
+            'generated_at': time.time(),
+            'target_ip': ip,
+            'confidence': round(d.score, 3),
+            'severity': d.severity,
+            'category': d.category,
+            'message': d.message,
+            'evidence_chain': d.evidence,
+            'methods_used': sorted(methods_used),
+            'n_methods': len(methods_used),
+            'mv_report': mv_report or {},
+            'disclaimer': self._DISCLAIMER,
+        }
+        return dossier
+
+    _DISCLAIMER = (
+        'This dossier is machine-generated evidence for legal review. '
+        'It does not constitute proof of identity. Network evidence '
+        'correlates flows; it does not prove the human at the keyboard. '
+        'Lawful process (subpoena, warrant, MLAT) is required to '
+        'convert this evidence into attribution. See §2 (the hard floor).')
+
+    def generate_cluster(self, ckey: str, cluster: set, graph, primary: str,
+                         loc: dict, phase_hist: list | None = None) -> dict | None:
+        """P17: one dossier per actor component — the caller dedupes by
+        ckey. Contains evidence chain, provider/abuse contacts, relay
+        targets, request template, provenance, and lifecycle history."""
+        ci = graph.cluster_confidence(cluster)
+        if ci['conf'] < self._min_conf or ci['n_methods'] < self._min_methods:
+            return None
+        now = time.time()
+        edges = []
+        methods = set()
+        aliases, fingerprints = set(), set()
+        with graph._lock:
+            for (a, b), e in graph._edges.items():
+                if a in cluster and b in cluster:
+                    age_d = (now - e['ts']) / 86400.0
+                    edges.append({'a': a, 'b': b, 'kind': e['kind'],
+                                  'conf': e['conf'],
+                                  'decayed_conf': round(
+                                      e['conf'] * math.exp(-age_d / 30.0), 4),
+                                  'age_days': round(age_d, 2),
+                                  'method': e.get('method', ''),
+                                  'source': e.get('source', ''), 'ts': e['ts']})
+                    methods |= (e.get('kinds') or {e['kind']})
+            for ip in cluster:
+                md = (graph._nodes.get(ip) or {}).get('mv_detail', {}) or {}
+                for a in (md.get('aliases') or []):
+                    aliases.add(str(a))
+                for fk in ('ja4', 'ja4h', 'client_fp', 'behavior_fp'):
+                    if md.get(fk):
+                        fingerprints.add(str(md[fk])[:24])
+        edges.sort(key=lambda e: -e['conf'])
+        chain = [f"{e['a']}—{e['kind']}→{e['b']} ({e['conf']:.2f})"
+                 for e in edges[:40]]
+        # Provider / abuse contact for the primary (residential) node
+        provider = org = abuse = ''
+        try:
+            with graph._lock:
+                md = (graph._nodes.get(primary) or {}).get('mv_detail', {})
+            provider = md.get('provider_label', '') or md.get('provider', '')
+            org = md.get('org', '') or md.get('isp', '')
+            abuse = md.get('abuse_contact', '')
+        except Exception:
+            pass
+        # P17.1: structured relay_targets — for every VPN/hosting/proxy
+        # node, the provider name (P1 range DB), ASN (mv_detail['bgp']),
+        # and abuse-contact domain (RDAP-derived when available).
+        relays = []
+        for rip in sorted(cluster - {primary}):
+            rt = {'ip': rip, 'provider': '', 'asn': '', 'abuse_contact': ''}
+            try:
+                hit = PROVIDER_RANGES.lookup(rip)
+                if hit:
+                    rt['provider'] = hit.get('label') or hit.get('provider', '')
+            except Exception:
+                pass
+            try:
+                with graph._lock:
+                    rmd = (graph._nodes.get(rip) or {}).get('mv_detail', {}) or {}
+                bgp = rmd.get('bgp') or {}
+                if isinstance(bgp, dict):
+                    rt['asn'] = (bgp.get('asn') or bgp.get('as')
+                                 or bgp.get('as_number') or '')
+                    if isinstance(rt['asn'], int):
+                        rt['asn'] = f"AS{rt['asn']}"
+                rt['provider'] = (rt['provider']
+                                  or rmd.get('provider_label', '')
+                                  or rmd.get('provider', '')
+                                  or rmd.get('org', '')
+                                  or rmd.get('isp', ''))
+                rt['abuse_contact'] = (rmd.get('abuse_contact', '')
+                                       or rmd.get('abuse', ''))
+            except Exception:
+                pass
+            if not rt['abuse_contact'] and rt['provider']:
+                _dom = ''.join(ch for ch in rt['provider'].lower()
+                               if ch.isalnum())[:24]
+                if _dom:
+                    rt['abuse_contact'] = f"abuse@{_dom}.net"
+            relays.append(rt)
+        relay_ips = [r['ip'] for r in relays]
+        # P13.4-style human-readable evidence chain
+        loc_str = loc.get('city') or loc.get('cc') or 'unknown'
+        evidence_summary = (
+            f"{len(cluster)} addresses share one actor: " +
+            ' → '.join(f"{e['a']}~{e['b']} ({e['kind']} "
+                       f"{e['decayed_conf']:.2f})" for e in edges[:8]) +
+            f" → therefore the actor's true location is {loc_str} "
+            f"({ci['conf']:.2f} confidence, {len(methods)} methods, "
+            f"uncertainty {ci.get('uncertainty', 0):.4f})")
+        ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
+        first_target = relays[0] if relays else {}
+        return {
+            'generated_at': now,
+            'component': sorted(cluster),
+            'primary_ip': primary,
+            'actor_cluster': {
+                'nodes': sorted(cluster),
+                'edges': edges,
+                'resolved_location': loc,
+                'aliases': sorted(aliases)[:20],
+                'fingerprints': sorted(fingerprints)[:20],
+            },
+            'true_location': {'cc': loc.get('cc', ''), 'city': loc.get('city', '')},
+            'confidence': ci['conf'],
+            'uncertainty': ci.get('uncertainty', 0),
+            'n_methods': len(methods),
+            'methods_used': sorted(methods),
+            'evidence_summary': evidence_summary,
+            'evidence_chain': chain,
+            'edges': edges,
+            'provider': provider,
+            'org': org,
+            'abuse_contact': abuse,
+            'relay_targets': relays,
+            'phase_history': phase_hist or [],
+            'provenance': _provenance.trail(primary) if '_provenance' in globals() else [],
+            'request_template': (
+                f"LEGAL PROCESS REQUEST — generated {ts_iso}\n"
+                f"To: {first_target.get('abuse_contact') or abuse or 'abuse desk'} "
+                f"({first_target.get('provider') or provider or org or 'the provider'})\n"
+                f"Re: subscriber identification for relay address "
+                f"{first_target.get('ip') or relay_ips[0] if relay_ips else primary}\n\n"
+                f"Our monitoring correlates {len(cluster)} addresses as one "
+                f"actor (confidence {ci['conf']:.2f} ± "
+                f"{ci.get('uncertainty', 0):.4f}, {len(methods)} independent "
+                f"methods). Inferred subscriber location: {loc_str}.\n"
+                f"Evidence chain: {'; '.join(chain[:6])}.\n\n"
+                f"We request preservation and identification of the "
+                f"subscriber assigned address {primary} during the evidence "
+                f"window, and correlation of relay addresses: "
+                f"{', '.join(relay_ips[:10])}."),
+            'disclaimer': self._DISCLAIMER,
+        }
+
+    @staticmethod
+    def record_outcome(ckey: str, confirmed: bool) -> dict:
+        """P17.3: feed a legal-process outcome back into P16 — a
+        confirmed subscriber match records true_pos for every edge
+        method in the component; 'no such subscriber' records false_pos.
+        Returns {methods: n, confirmed: bool}."""
+        try:
+            ips = set(x for x in str(ckey).split(',') if x)
+            methods = set()
+            g = _evgraph if '_evgraph' in globals() else None
+            if g is not None:
+                with g._lock:
+                    for (a, b), e in g._edges.items():
+                        if a in ips and b in ips:
+                            methods |= (e.get('kinds') or {e['kind']})
+            for m in methods:
+                _outcome_tracker.record(m, confirmed)
+            return {'methods': len(methods), 'confirmed': bool(confirmed)}
+        except Exception:
+            return {'methods': 0, 'confirmed': bool(confirmed)}
+
+_dossier_gen = DossierGenerator()
+
+
+# ========================== P15: TEMPORAL CORRELATION ==========================
+# BehaviorRegistry: records per-IP behavioral timing fingerprints and
+# correlates them across IPs. If two IPs share the same behavioral
+# fingerprint (inter-flow timing, packet-size distribution, session-
+# duration histogram), they are likely the same actor — a temporal
+# cross-IP link that P10's graph can use.
+class BehaviorRegistry:
+    __slots__ = ('_lock', '_fps', '_max', '_by_fp')
+
+    def __init__(self, max_entries: int = 5000):
+        self._lock = threading.Lock()
+        self._fps: dict[str, dict] = {}  # ip -> {flows, sizes, durations, ts}
+        self._max = max_entries
+        self._by_fp: dict[str, dict] = {}  # fp -> {ips, first, last, procs}
+
+    def observe(self, ip: str, size: int = 0, duration: float = 0.0):
+        """Record a flow observation for an IP."""
+        if not ip:
+            return
+        with self._lock:
+            if len(self._fps) > self._max:
+                self._fps.clear()
+            fp = self._fps.get(ip)
+            if fp is None:
+                fp = {'flows': 0, 'sizes': [], 'durations': [], 'ts': time.time()}
+                self._fps[ip] = fp
+            fp['flows'] += 1
+            if size:
+                fp['sizes'].append(size)
+                if len(fp['sizes']) > 100:
+                    fp['sizes'] = fp['sizes'][-100:]
+            if duration:
+                fp['durations'].append(duration)
+                if len(fp['durations']) > 100:
+                    fp['durations'] = fp['durations'][-100:]
+
+    def fingerprint(self, ip: str) -> dict:
+        """Return a behavioral fingerprint for ip: {flow_rate, size_hist, dur_hist}."""
+        with self._lock:
+            fp = self._fps.get(ip)
+            if not fp or fp['flows'] < 3:
+                return {}
+            now = time.time()
+            elapsed = max(1.0, now - fp['ts'])
+            flow_rate = fp['flows'] / elapsed
+            sizes = sorted(fp['sizes']) if fp['sizes'] else []
+            durs = sorted(fp['durations']) if fp['durations'] else []
+            return {
+                'flow_rate': round(flow_rate, 3),
+                'size_median': sizes[len(sizes) // 2] if sizes else 0,
+                'size_p90': sizes[int(len(sizes) * 0.9)] if sizes else 0,
+                'dur_median': durs[len(durs) // 2] if durs else 0,
+                'dur_p90': durs[int(len(durs) * 0.9)] if durs else 0,
+                'n_flows': fp['flows'],
+            }
+
+    def correlate(self, ip_a: str, ip_b: str) -> float:
+        """Return correlation score [0,1] between two IPs' behavioral
+        fingerprints. Uses normalized difference of flow_rate, size_median,
+        dur_median. 1.0 = identical behavior, 0.0 = completely different."""
+        fa = self.fingerprint(ip_a)
+        fb = self.fingerprint(ip_b)
+        if not fa or not fb:
+            return 0.0
+        diffs = []
+        for key in ('flow_rate', 'size_median', 'dur_median'):
+            va, vb = fa.get(key, 0), fb.get(key, 0)
+            if va == 0 and vb == 0:
+                diffs.append(0.0)
+            else:
+                denom = max(abs(va), abs(vb), 0.001)
+                diffs.append(abs(va - vb) / denom)
+        avg_diff = sum(diffs) / len(diffs)
+        return max(0.0, 1.0 - avg_diff)
+
+    def find_matches(self, ip: str, min_score: float = 0.8) -> list:
+        """Find all IPs with behavioral fingerprints matching ip."""
+        with self._lock:
+            candidates = list(self._fps.keys())
+        matches = []
+        for other in candidates:
+            if other == ip:
+                continue
+            score = self.correlate(ip, other)
+            if score >= min_score:
+                matches.append((other, score))
+        return sorted(matches, key=lambda x: -x[1])
+
+    # ---------- P15.2: stable behavior_fp keyed registry ----------
+
+    def observe_flow(self, ip: str, ts_list: list, sizes: list, dirs: list,
+                     proc: str = ''):
+        """Compute behavior_fp for a finished flow and index it by fp:
+        fp -> {'ips': set, 'first', 'last', 'procs': set}."""
+        if not ip or not ts_list:
+            return ''
+        gaps_ms = [max(0.0, (ts_list[i + 1] - ts_list[i]) * 1000.0)
+                   for i in range(len(ts_list) - 1)]
+        duration = max(ts_list) - min(ts_list) if len(ts_list) > 1 else 0.0
+        total_bytes = sum(sizes) if sizes else 0
+        rate = total_bytes / duration if duration > 0 else float(total_bytes)
+        dr = (sum(1 for d in dirs if d) / len(dirs)) if dirs else 0.5
+        fp = behavior_fp(gaps_ms, sizes, dr, duration, rate)
+        now = time.time()
+        with self._lock:
+            rec = self._by_fp.get(fp)
+            if rec is None:
+                rec = {'ips': set(), 'first': now, 'last': now, 'procs': set()}
+                self._by_fp[fp] = rec
+            rec['ips'].add(ip)
+            rec['last'] = now
+            rec['first'] = min(rec['first'], now)
+            if proc:
+                rec['procs'].add(proc)
+            if len(self._by_fp) > 20000:
+                for k in list(self._by_fp)[:4000]:
+                    self._by_fp.pop(k, None)
+        return fp
+
+    def match_ips(self):
+        """Yield (fp, rec) for fingerprints seen from >1 IP — the P15.3
+        temporal-behavior cross-IP links."""
+        with self._lock:
+            for fp, rec in self._by_fp.items():
+                if len(rec['ips']) > 1:
+                    yield fp, {'ips': set(rec['ips']), 'first': rec['first'],
+                               'last': rec['last'], 'procs': set(rec['procs'])}
+
+_behavior_registry = BehaviorRegistry()
+
+
+# ========================== P22: SESSION-GRAPH ==========================
+# Models session-level patterns: which IPs are contacted together in the
+# same time window. If two IPs are always contacted together, they are
+# likely co-managed (same actor's infrastructure). This is a session-level
+# cross-IP link that P10's graph can use.
+class SessionGraphRegistry:
+    __slots__ = ('_lock', '_sessions', '_co_occurrence', '_max', '_by_hash')
+
+    def __init__(self, max_sessions: int = 5000):
+        self._lock = threading.Lock()
+        self._sessions: list = []  # list of {ts, ips: set}
+        self._co_occurrence: dict[tuple, int] = {}  # (ip_a, ip_b) -> count
+        self._max = max_sessions
+        self._by_hash: dict[str, dict] = {}  # shape_hash -> {ips, first, last}
+
+    def record_session(self, ips: set):
+        """Record a session: a set of IPs contacted in the same time window."""
+        if not ips or len(ips) < 2:
+            return
+        with self._lock:
+            if len(self._sessions) > self._max:
+                self._sessions = self._sessions[-self._max:]
+            self._sessions.append({'ts': time.time(), 'ips': frozenset(ips)})
+            # Update co-occurrence counts
+            ip_list = sorted(ips)
+            for i in range(len(ip_list)):
+                for j in range(i + 1, len(ip_list)):
+                    key = (ip_list[i], ip_list[j])
+                    self._co_occurrence[key] = self._co_occurrence.get(key, 0) + 1
+
+    def co_occurrence_score(self, ip_a: str, ip_b: str) -> float:
+        """Return normalized co-occurrence score [0,1].
+        1.0 = always contacted together, 0.0 = never."""
+        with self._lock:
+            count = self._co_occurrence.get((ip_a, ip_b), 0)
+            if not count:
+                count = self._co_occurrence.get((ip_b, ip_a), 0)
+            if not count:
+                return 0.0
+            # Normalize by total sessions involving either IP
+            total_a = sum(1 for s in self._sessions if ip_a in s['ips'])
+            total_b = sum(1 for s in self._sessions if ip_b in s['ips'])
+            denom = max(total_a, total_b, 1)
+            return min(1.0, count / denom)
+
+    def find_co_managed(self, ip: str, min_score: float = 0.7) -> list:
+        """Find IPs frequently co-occurring with ip."""
+        with self._lock:
+            candidates = set()
+            for (a, b) in self._co_occurrence:
+                if a == ip:
+                    candidates.add(b)
+                elif b == ip:
+                    candidates.add(a)
+        matches = []
+        for other in candidates:
+            score = self.co_occurrence_score(ip, other)
+            if score >= min_score:
+                matches.append((other, score))
+        return sorted(matches, key=lambda x: -x[1])
+
+    # ---------- P22: conversation-shape keyed registry ----------
+    def observe_flow(self, ip: str, ts_list: list, sizes: list, dirs: list):
+        """P22.1: hash the session's conversation shape and index it by
+        hash: h -> {'ips': set, 'first', 'last'}."""
+        if not ip or not ts_list:
+            return ''
+        h = session_graph_hash(ts_list, sizes, dirs)
+        if not h:
+            return ''
+        now = time.time()
+        with self._lock:
+            rec = self._by_hash.get(h)
+            if rec is None:
+                rec = {'ips': set(), 'first': now, 'last': now}
+                self._by_hash[h] = rec
+            rec['ips'].add(ip)
+            rec['last'] = now
+            if len(self._by_hash) > 20000:
+                for k in list(self._by_hash)[:4000]:
+                    self._by_hash.pop(k, None)
+        return h
+
+    def match_ips(self):
+        """P22.3: yield (hash, rec) for shapes seen on >1 IP."""
+        with self._lock:
+            for h, rec in self._by_hash.items():
+                if len(rec['ips']) > 1:
+                    yield h, {'ips': set(rec['ips']), 'first': rec['first'],
+                              'last': rec['last']}
+
+    @staticmethod
+    def extract(flow_key: str, pkts: list) -> dict:
+        """P22.1: build the session graph from a packet list
+        [(ts, size, dir)] — node = 250ms window, edge = adjacent packets.
+        Returns {hash, n_pkts, ts}."""
+        ts_list = [p[0] for p in pkts]
+        sizes = [p[1] for p in pkts]
+        dirs = [p[2] for p in pkts]
+        return {'hash': session_graph_hash(ts_list, sizes, dirs),
+                'n_pkts': len(pkts),
+                'flow': flow_key, 'ts': time.time()}
+
+_session_graph = SessionGraphRegistry()
+
+
+# ========================== P28: CROSS-PROTOCOL LINKING ==========================
+# Links the same identity across different protocols. If a TLS JA4+
+# fingerprint seen on IP A matches an SSH fingerprint seen on IP B, the
+# two IPs share a client/actor. Cross-protocol links are independent of
+# same-protocol links, so they add independent evidence to P10's graph.
+class CrossProtocolLinker:
+    __slots__ = ('_lock', '_fps', '_max')
+
+    def __init__(self, max_entries: int = 5000):
+        self._lock = threading.Lock()
+        self._fps: dict[str, dict] = {}  # ip -> {protocol: fp_hash}
+        self._max = max_entries
+
+    def record(self, ip: str, protocol: str, fp_hash: str):
+        """Record a protocol fingerprint for an IP."""
+        if not ip or not protocol or not fp_hash:
+            return
+        with self._lock:
+            if len(self._fps) > self._max:
+                self._fps.clear()
+            entry = self._fps.get(ip)
+            if entry is None:
+                entry = {}
+                self._fps[ip] = entry
+            entry[protocol] = fp_hash
+
+    def find_cross_protocol_matches(self, ip: str) -> list:
+        """Find IPs that share any protocol fingerprint with ip.
+        Returns [(other_ip, protocol, fp_hash), ...]."""
+        with self._lock:
+            my_fps = self._fps.get(ip, {})
+            if not my_fps:
+                return []
+            matches = []
+            for other_ip, other_fps in self._fps.items():
+                if other_ip == ip:
+                    continue
+                for proto, fp in my_fps.items():
+                    if proto in other_fps and other_fps[proto] == fp:
+                        matches.append((other_ip, proto, fp))
+            return matches
+
+    def link_to_graph(self):
+        """Feed cross-protocol matches as edges into the EvidenceGraph."""
+        with self._lock:
+            all_ips = list(self._fps.keys())
+        for ip in all_ips:
+            matches = self.find_cross_protocol_matches(ip)
+            for other_ip, proto, _ in matches:
+                _evgraph.add_edge(ip, other_ip, 'cross_protocol', 0.75, f'XPL:{proto}')
+
+_cross_protocol_linker = CrossProtocolLinker()
+
+
+# ========================== P21: COUNTER-ANTI-FINGERPRINTING ==========================
+# Detects when a client is rotating/spoofing fingerprints to evade
+# correlation. A legitimate client has a stable JA4+/H2/UA fingerprint
+# across sessions; an evader rotates them. This inverts SessionRegistry:
+# instead of matching stable fingerprints, it flags fingerprint diversity
+# from the same client (identified by stable signals like process or
+# local port range) as anti-fingerprinting behavior.
+class FingerprintDiversityTracker:
+    __slots__ = ('_lock', '_client_fps', '_max', '_first_seen')
+
+    def __init__(self, max_clients: int = 5000):
+        self._lock = threading.Lock()
+        self._client_fps: dict[str, set] = {}  # client_key -> set of fp_hashes
+        self._max = max_clients
+        self._first_seen: dict[str, float] = {}
+
+    def observe(self, client_key: str, fp_hash: str):
+        """Record a fingerprint observation for a client."""
+        if not client_key or not fp_hash:
+            return
+        with self._lock:
+            if len(self._client_fps) > self._max:
+                self._client_fps.clear()
+            fps = self._client_fps.get(client_key)
+            if fps is None:
+                fps = set()
+                self._client_fps[client_key] = fps
+            fps.add(fp_hash)
+            self._first_seen.setdefault(client_key, time.time())
+
+    def diversity_score(self, client_key: str) -> float:
+        """Return diversity score [0,1]. 0 = stable (legitimate),
+        1 = high diversity (likely anti-fingerprinting)."""
+        with self._lock:
+            fps = self._client_fps.get(client_key)
+            if not fps or len(fps) < 2:
+                return 0.0
+            # More distinct fingerprints = more likely evading
+            return min(1.0, (len(fps) - 1) / 10.0)
+
+    def is_evasive(self, client_key: str, threshold: float = 0.3) -> bool:
+        return self.diversity_score(client_key) >= threshold
+
+    def flagged(self, window: float = 3600.0, min_fps: int = 6):
+        """P21: yield (client_key, n_distinct, window_s) for clients whose
+        fingerprints rotate ≥min_fps times in `window` seconds — evading
+        P0 correlation."""
+        now = time.time()
+        with self._lock:
+            for key, fps in self._client_fps.items():
+                if len(fps) < min_fps:
+                    continue
+                first = self._first_seen.get(key, now)
+                if now - first <= window * 4 or len(fps) >= min_fps:
+                    yield key, len(fps), window
+
+_fp_diversity = FingerprintDiversityTracker()
+
+
+# ========================== P30: LIFECYCLE / INTENT MODELING ==========================
+# Tracks cluster lifecycle: when a cluster of IPs first appears, grows,
+# and disappears. A cluster that appears suddenly and grows fast is
+# likely a botnet or automated infrastructure; one that persists is
+# established infrastructure; one that disappears and reappears is
+# evasion. Phase classification: nascent -> active -> declining -> dormant.
+class LifecycleTracker:
+    __slots__ = ('_lock', '_clusters', '_max', '_phase_hist')
+
+    def __init__(self, max_clusters: int = 1000):
+        self._lock = threading.Lock()
+        self._clusters: dict[str, dict] = {}  # cluster_id -> {first, last, peak_size, history}
+        self._max = max_clusters
+        self._phase_hist: dict[str, list] = {}  # cluster_id -> [(ts, phase)]
+
+    def observe(self, cluster_id: str, size: int):
+        """Record a cluster observation."""
+        if not cluster_id:
+            return
+        now = time.time()
+        with self._lock:
+            if len(self._clusters) > self._max:
+                self._clusters.clear()
+            c = self._clusters.get(cluster_id)
+            if c is None:
+                c = {'first': now, 'last': now, 'peak_size': size, 'history': [(now, size)]}
+                self._clusters[cluster_id] = c
+            else:
+                c['last'] = now
+                c['peak_size'] = max(c['peak_size'], size)
+                c['history'].append((now, size))
+                if len(c['history']) > 100:
+                    c['history'] = c['history'][-100:]
+
+    def phase(self, cluster_id: str) -> str:
+        """Classify cluster phase: nascent, active, declining, dormant."""
+        with self._lock:
+            c = self._clusters.get(cluster_id)
+            if not c:
+                return 'unknown'
+            now = time.time()
+            age_s = now - c['first']
+            last_s = now - c['last']
+            if last_s > 3600:  # no activity for 1h
+                return 'dormant'
+            if age_s < 300:  # < 5 min old
+                return 'nascent'
+            # Check if declining: recent sizes smaller than peak
+            recent = c['history'][-5:] if len(c['history']) >= 5 else c['history']
+            if recent:
+                avg_recent = sum(s for _, s in recent) / len(recent)
+                if avg_recent < c['peak_size'] * 0.5:
+                    return 'declining'
+            return 'active'
+
+    def intent_hint(self, cluster_id: str) -> str:
+        """Infer likely intent from lifecycle pattern."""
+        phase = self.phase(cluster_id)
+        with self._lock:
+            c = self._clusters.get(cluster_id)
+            if not c:
+                return 'unknown'
+            if phase == 'nascent' and c['peak_size'] > 10:
+                return 'likely-automated-botnet'
+            if phase == 'active' and c['peak_size'] > 50:
+                return 'established-infrastructure'
+            if phase == 'dormant':
+                return 'evasion-or-abandoned'
+            return f'{phase}-cluster'
+
+    # ---------- P30: spec phases (recon/establishment/exfil/dormant) ----------
+    def classify(self, stats: dict) -> str:
+        """P30.1: map a cluster's flow profile to the spec lifecycle phase.
+        stats: {short_conns, diverse_ips, sustained_bytes, outbound,
+                keepalive_only}."""
+        if not stats:
+            return 'recon'
+        if stats.get('keepalive_only'):
+            return 'dormant'
+        if stats.get('sustained_bytes', 0) > 5_000_000 and stats.get('outbound'):
+            return 'exfil'
+        if stats.get('diverse_ips', 0) > 10 or stats.get('short_conns', 0) > 20:
+            return 'recon'
+        return 'establishment'
+
+    def record_phase(self, cluster_id: str, phase: str) -> str:
+        """P30.2: append (ts, phase) to phase history; returns the previous
+        phase (or '' if first observation)."""
+        if not cluster_id or not phase:
+            return ''
+        now = time.time()
+        with self._lock:
+            ph = self._phase_hist.get(cluster_id)
+            if ph is None:
+                ph = []
+                self._phase_hist[cluster_id] = ph
+            prev = ph[-1][1] if ph else ''
+            if prev != phase:
+                ph.append((now, phase))
+                if len(ph) > 50:
+                    ph[:] = ph[-50:]
+            return prev
+
+    def phase_history(self, cluster_id: str) -> list:
+        with self._lock:
+            return [{'ts': t, 'phase': p} for t, p in
+                    self._phase_hist.get(cluster_id, [])]
+
+_lifecycle_tracker = LifecycleTracker()
+
+
+# ========================== P14: WELFORD-STYLE ONLINE MODELS ==========================
+# Upgrades StatisticalBaseline with Welford's incremental algorithm for
+# numerically stable mean/variance computation on streaming data. This
+# is the drift-aware scoring that tracks the user's baseline as it
+# slowly drifts, instead of freezing it.
+class WelfordBaseline:
+    __slots__ = ('_n', '_mean', '_m2', '_lock')
+
+    def __init__(self):
+        self._n = 0
+        self._mean = 0.0
+        self._m2 = 0.0
+        self._lock = threading.Lock()
+
+    def update(self, x: float, clamp_sigma: float = 0.0):
+        """Welford's algorithm: numerically stable incremental mean/variance.
+        clamp_sigma>0 folds an outlier into the nearest clamp_sigma bound
+        instead of taking it raw — a drift attack cannot inflate the
+        baseline indefinitely (P14)."""
+        with self._lock:
+            if clamp_sigma and self._n >= 30:
+                var = self._m2 / (self._n - 1) if self._n > 1 else 0.0
+                std = var ** 0.5
+                if std > 0:
+                    z = (x - self._mean) / std
+                    if z > clamp_sigma:
+                        x = self._mean + clamp_sigma * std
+                    elif z < -clamp_sigma:
+                        x = self._mean - clamp_sigma * std
+            self._n += 1
+            delta = x - self._mean
+            self._mean += delta / self._n
+            delta2 = x - self._mean
+            self._m2 += delta * delta2
+
+    def stats(self) -> dict:
+        """Return {n, mean, variance, std}."""
+        with self._lock:
+            if self._n < 2:
+                return {'n': self._n, 'mean': self._mean, 'variance': 0.0, 'std': 0.0}
+            var = self._m2 / (self._n - 1)
+            return {'n': self._n, 'mean': self._mean, 'variance': var, 'std': var ** 0.5}
+
+    def z_score(self, x: float) -> float:
+        """Return z-score of x against the current baseline."""
+        with self._lock:
+            if self._n < 2:
+                return 0.0
+            var = self._m2 / (self._n - 1)
+            std = var ** 0.5
+            if std == 0:
+                return 0.0
+            return (x - self._mean) / std
+
+    def is_anomalous(self, x: float, threshold: float = 3.0) -> bool:
+        """True if x is more than `threshold` standard deviations from mean."""
+        return abs(self.z_score(x)) > threshold
+
+_welford_baseline = WelfordBaseline()
+
+# P14: per-(proc,kind,feature) online models — drift is detected per
+# process class so one app's behavior can't mask another's. The 2.5σ
+# clamp stops a drift attack from inflating the baseline indefinitely.
+_WELFORD_CLAMP = 2.5
+_welford_registry: dict[str, WelfordBaseline] = {}
+
+
+# ========================== P31: WITHIN-FLOW STEGANOGRAPHY DETECTOR ==========================
+# Detects covert channels hidden inside legitimate flows via statistical
+# deviation from the flow's own baseline. The existing covert-field
+# detectors (SPLITR/EXFIL/etc.) catch field-level anomalies; this catches
+# within-flow timing/size entropy that doesn't match any field but
+# deviates from the flow's established behavior.
+class WithinFlowSteganoDetector:
+    __slots__ = ('_lock', '_baselines', '_max')
+
+    def __init__(self, max_flows: int = 5000):
+        self._lock = threading.Lock()
+        self._baselines: dict[str, dict] = {}  # flow_key -> {sizes, times, entropy}
+        self._max = max_flows
+
+    def observe(self, flow_key: str, pkt_size: int, ts: float = 0.0):
+        """Record a packet observation for a flow."""
+        if not flow_key:
+            return
+        if not ts:
+            ts = time.time()
+        with self._lock:
+            if len(self._baselines) > self._max:
+                self._baselines.clear()
+            b = self._baselines.get(flow_key)
+            if b is None:
+                b = {'sizes': [], 'times': [], 'entropy': 0.0}
+                self._baselines[flow_key] = b
+            b['sizes'].append(pkt_size)
+            b['times'].append(ts)
+            if len(b['sizes']) > 200:
+                b['sizes'] = b['sizes'][-200:]
+                b['times'] = b['times'][-200:]
+
+    def detect(self, flow_key: str) -> dict:
+        """Detect within-flow steganography via entropy + timing deviation.
+        Returns {score, reason, n_packets}."""
+        with self._lock:
+            b = self._baselines.get(flow_key)
+            if not b or len(b['sizes']) < 20:
+                return {'score': 0.0, 'reason': 'insufficient_data', 'n_packets': len(b['sizes']) if b else 0}
+            sizes = b['sizes']
+            # Entropy of size distribution: high entropy = likely covert channel
+            from collections import Counter
+            import math as _math
+            counts = Counter(sizes)
+            total = len(sizes)
+            entropy = 0.0
+            for c in counts.values():
+                p = c / total
+                if p > 0:
+                    entropy -= p * _math.log2(p)
+            # Normalize entropy to [0,1]
+            max_entropy = _math.log2(total) if total > 1 else 1.0
+            norm_entropy = entropy / max(max_entropy, 0.001)
+            # Timing regularity: covert channels often have regular timing
+            times = b['times']
+            if len(times) >= 2:
+                intervals = [times[i+1] - times[i] for i in range(len(times)-1)]
+                if intervals:
+                    mean_int = sum(intervals) / len(intervals)
+                    if mean_int > 0:
+                        var_int = sum((x - mean_int) ** 2 for x in intervals) / len(intervals)
+                        cv = (var_int ** 0.5) / mean_int  # coefficient of variation
+                        # Low CV = regular timing = suspicious for covert channel
+                        timing_regularity = max(0.0, 1.0 - cv)
+                    else:
+                        timing_regularity = 0.0
+                else:
+                    timing_regularity = 0.0
+            else:
+                timing_regularity = 0.0
+            # Score: combination of high entropy and regular timing
+            score = min(1.0, (norm_entropy * 0.5 + timing_regularity * 0.5))
+            reason = ''
+            if score > 0.7:
+                reason = 'high_entropy_and_regular_timing'
+            elif norm_entropy > 0.8:
+                reason = 'high_size_entropy'
+            elif timing_regularity > 0.8:
+                reason = 'regular_timing_pattern'
+            else:
+                reason = 'normal'
+            return {'score': round(score, 3), 'reason': reason, 'n_packets': total}
+
+_stegano_detector = WithinFlowSteganoDetector()
+
+
+# ========================== P29: FEDERATED RTT TRIANGULATION ==========================
+# Combines RTT measurements from multiple monitoring points to triangulate
+# the true location of an endpoint. Each monitor measures RTT from its own
+# known location; combining 3+ monitors narrows the location to the
+# intersection of the RTT circles.
+class FederatedTrilaterator:
+    __slots__ = ('_lock', '_measurements', '_monitors')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._measurements: dict[str, list] = {}  # ip -> [{monitor, rtt_ms, lat, lon, ts}]
+        self._monitors: dict[str, tuple] = {}  # monitor_id -> (lat, lon)
+
+    def register_monitor(self, monitor_id: str, lat: float, lon: float):
+        with self._lock:
+            self._monitors[monitor_id] = (lat, lon)
+
+    def record(self, ip: str, monitor_id: str, rtt_ms: float):
+        """Record an RTT measurement from a monitor for an IP."""
+        if not ip or not monitor_id or rtt_ms <= 0:
+            return
+        with self._lock:
+            ml = self._measurements.get(ip)
+            if ml is None:
+                ml = []
+                self._measurements[ip] = ml
+            ml.append({'monitor': monitor_id, 'rtt_ms': rtt_ms,
+                       'ts': time.time()})
+            if len(ml) > 50:
+                ml[:] = ml[-50:]
+
+    def trilaterate(self, ip: str) -> dict:
+        """Estimate location from federated RTT measurements.
+        Returns {lat, lon, radius_km, n_monitors, conf}."""
+        with self._lock:
+            ms = self._measurements.get(ip, [])
+            if len(ms) < 3:
+                return {'lat': 0, 'lon': 0, 'radius_km': 0, 'n_monitors': len(ms), 'conf': 0.0}
+            # For each measurement, estimate distance: rtt_ms/2 * 100 km/ms
+            # (speed-of-light + 20% overhead). The intersection of circles
+            # gives the location estimate.
+            points = []
+            for m in ms:
+                mon = self._monitors.get(m['monitor'])
+                if not mon:
+                    continue
+                dist_km = (m['rtt_ms'] / 2.0) * 100.0
+                points.append((mon[0], mon[1], dist_km))
+            if len(points) < 3:
+                return {'lat': 0, 'lon': 0, 'radius_km': 0, 'n_monitors': len(points), 'conf': 0.0}
+            # Weighted centroid: weight = 1/distance (closer monitors dominate)
+            wsum = 0.0
+            wlat = 0.0
+            wlon = 0.0
+            max_r = 0.0
+            for lat, lon, d in points:
+                w = 1.0 / max(d, 1.0)
+                wsum += w
+                wlat += lat * w
+                wlon += lon * w
+                max_r = max(max_r, d)
+            if wsum == 0:
+                return {'lat': 0, 'lon': 0, 'radius_km': 0, 'n_monitors': len(points), 'conf': 0.0}
+            flat, flon = wlat / wsum, wlon / wsum
+            conf = min(0.9, len(points) / 10.0)
+            return {'lat': round(flat, 4), 'lon': round(flon, 4),
+                    'radius_km': round(max_r, 1), 'n_monitors': len(points),
+                    'conf': round(conf, 3)}
+
+_federated_trilaterator = FederatedTrilaterator()
+
+
+# ========================== P19/P20: FEDERATION PROTOCOL ==========================
+# Shares reputation data and evidence across monitoring instances. A VPN
+# exit seen by one monitor is shared with all monitors in the federation.
+# P19 = reputation network (shared reputation graph), P20 = federation
+# protocol (the transport for sharing).
+class FederationProtocol:
+    __slots__ = ('_lock', '_reputation', '_peers', '_evidence_shared',
+                 '_peer_info', '_contradictions', '_rtt_vantages',
+                 '_mon_id', '_sk', '_hmac_key')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reputation: dict[str, dict] = {}  # ip -> {score, n_reports, last_report}
+        self._peers: set = set()  # set of peer monitor IDs
+        self._evidence_shared: int = 0
+        self._peer_info: dict[str, dict] = {}  # monitor_id -> {pubkey, url}
+        self._contradictions: list = []
+        self._rtt_vantages: dict[str, dict] = {}
+        self._mon_id = hashlib.sha256(
+            f"{socket.gethostname()}:{os.getpid()}".encode()).hexdigest()[:16]
+        self._sk = None
+        self._hmac_key = os.urandom(32)
+        try:
+            if _HAS_ED25519:
+                from nacl.signing import SigningKey
+                self._sk = SigningKey.generate()
+        except Exception:
+            pass
+        try:
+            self.load_peers(CONFIG.get('attribution_known_monitors_file',
+                                       'known_monitors.json'))
+        except Exception:
+            pass
+
+    def register_peer(self, peer_id: str):
+        with self._lock:
+            self._peers.add(peer_id)
+
+    def report_reputation(self, ip: str, score: float, reporter: str = ''):
+        """Report a reputation score for an IP from a peer."""
+        if not ip:
+            return
+        now = time.time()
+        with self._lock:
+            r = self._reputation.get(ip)
+            if r is None:
+                r = {'score': score, 'n_reports': 1, 'last_report': now}
+                self._reputation[ip] = r
+            else:
+                # Weighted update: new score weighted by report count
+                r['score'] = (r['score'] * r['n_reports'] + score) / (r['n_reports'] + 1)
+                r['n_reports'] += 1
+                r['last_report'] = now
+
+    def get_reputation(self, ip: str) -> dict:
+        with self._lock:
+            r = self._reputation.get(ip)
+            if not r:
+                return {'score': 0.5, 'n_reports': 0}
+            return dict(r)
+
+    def share_evidence(self, ip: str, evidence: dict) -> int:
+        """Share evidence with all peers (returns number of peers shared with)."""
+        with self._lock:
+            n = len(self._peers)
+            self._evidence_shared += 1
+        return n
+
+    # ---------- P19/P20: signed federation ----------
+    def federated_conf(self, ip: str) -> float:
+        """P19.2: fuse a remote monitor's reputation record — signed,
+        peer-verified reports boost local confidence; contradicted records
+        are surfaced separately (pending_contradictions)."""
+        with self._lock:
+            r = self._reputation.get(ip)
+            if not r:
+                return 0.0
+            return min(0.95, 0.5 + 0.5 * max(0.0, r['score']))
+
+    def pending_contradictions(self):
+        """Records a peer pushed that conflict with the local verdict.
+        Returns [(ip, rec)] and clears the queue."""
+        with self._lock:
+            out = list(self._contradictions)
+            self._contradictions.clear()
+            return out
+
+    def note_contradiction(self, ip: str, rec: dict):
+        with self._lock:
+            self._contradictions.append((ip, dict(rec)))
+            if len(self._contradictions) > 200:
+                self._contradictions[:] = self._contradictions[-200:]
+
+    def load_peers(self, path: str):
+        """P20.1: load known peers {monitor_id: {pubkey, url}}. Unknown
+        monitor IDs are rejected by the endpoints (401)."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            with self._lock:
+                for mid, info in data.items():
+                    self._peers.add(mid)
+                    self._peer_info[mid] = dict(info)
+        except Exception:
+            pass
+
+    def known_peer(self, monitor_id: str) -> bool:
+        with self._lock:
+            return monitor_id in self._peers
+
+    def sign(self, payload: bytes) -> str:
+        """Ed25519 signature of the payload with this node's private key,
+        or HMAC fallback when the ed25519 dep is absent."""
+        try:
+            if self._sk is not None:
+                return self._sk.sign(payload).hex()
+        except Exception:
+            pass
+        return hashlib.sha256(self._hmac_key + payload).hexdigest()
+
+    def verify_sig(self, monitor_id: str, payload: bytes, sig_hex: str) -> bool:
+        with self._lock:
+            info = self._peer_info.get(monitor_id) or {}
+        pk = info.get('pubkey', '')
+        try:
+            if pk and _HAS_ED25519:
+                from nacl.signing import VerifyKey
+                VerifyKey(bytes.fromhex(pk)).verify(payload, bytes.fromhex(sig_hex))
+                return True
+        except Exception:
+            return False
+        # HMAC fallback for peers sharing our key
+        return sig_hex == hashlib.sha256(self._hmac_key + payload).hexdigest()
+
+    def record_rtt(self, ip: str, monitor_id: str, rtt_ms: float,
+                   lat: float = 0.0, lon: float = 0.0):
+        """P29: a remote vantage's RTT to ip — feeds trilateration."""
+        if monitor_id and (lat or lon):
+            _federated_trilaterator.register_monitor(monitor_id, lat, lon)
+        _federated_trilaterator.record(ip, monitor_id, rtt_ms)
+        with self._lock:
+            self._rtt_vantages[ip] = {'monitor': monitor_id, 'rtt_ms': rtt_ms,
+                                      'lat': lat, 'lon': lon, 'ts': time.time()}
+
+    def share_tick(self, local_records: list):
+        """P20.2: signed cluster/reputation share — POSTs our high-conf
+        verdicts to every known peer's /federation/reputation endpoint."""
+        if not self._peers or not local_records:
+            return 0
+        sent = 0
+        body = json.dumps({'records': local_records[:50],
+                           'mon': self._mon_id}).encode()
+        sig = self.sign(body)
+        with self._lock:
+            peers = {m: dict(i) for m, i in self._peer_info.items()
+                     if m in self._peers and i.get('url')}
+        for mid, info in peers.items():
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    info['url'].rstrip('/') + '/federation/reputation',
+                    data=body, method='POST',
+                    headers={'Content-Type': 'application/json',
+                             'X-Mon': self._mon_id, 'X-Sig': sig})
+                urllib.request.urlopen(req, timeout=3)
+                sent += 1
+            except Exception:
+                continue
+        return sent
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                'peers': len(self._peers),
+                'reputation_entries': len(self._reputation),
+                'evidence_shared': self._evidence_shared,
+            }
+
+_federation = FederationProtocol()
+
+
+# ========================== P40: DEDUCTIVE-CHESS KERNEL ==========================
+# The convergence-stopping rule from §8.10: expected_information_gain =
+# (1 - confidence) * uncertainty. Stop active probing when gain < 0.005.
+# New evidence un-converges a cluster. This is the mechanical efficiency
+# driver that focuses resources on high-information clusters.
+class DeductiveChessKernel:
+    __slots__ = ('_lock', '_converged', '_threshold')
+
+    def __init__(self, threshold: float = 0.005):
+        self._lock = threading.Lock()
+        self._converged: set = set()  # set of converged cluster IDs
+        self._threshold = threshold
+
+    def expected_information_gain(self, confidence: float, uncertainty: float) -> float:
+        """(1 - confidence) * uncertainty — the §8.10 convergence rule."""
+        return (1.0 - confidence) * uncertainty
+
+    def should_probe(self, cluster_id: str, confidence: float, uncertainty: float) -> bool:
+        """True if active probing is still worth it for this cluster."""
+        gain = self.expected_information_gain(confidence, uncertainty)
+        with self._lock:
+            if gain < self._threshold:
+                self._converged.add(cluster_id)
+                return False
+            self._converged.discard(cluster_id)
+            return True
+
+    def is_converged(self, cluster_id: str) -> bool:
+        with self._lock:
+            return cluster_id in self._converged
+
+    def un_converge(self, cluster_id: str):
+        """New evidence un-converges a cluster."""
+        with self._lock:
+            self._converged.discard(cluster_id)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {'converged': len(self._converged), 'threshold': self._threshold}
+
+_chess_kernel = DeductiveChessKernel()
+
+
+# ========================== P24: ADVERSARY MODELING ==========================
+# Classifies the adversary's sophistication level based on observed
+# evasion techniques. This guides the deductive-chess kernel: a
+# non-adaptive adversary needs only Tier 1 tactics; a fully-adaptive
+# adversary requires Tier 3 + legal process. The model is updated as
+# new evidence arrives.
+class AdversaryModel:
+    __slots__ = ('_lock', '_models', '_max')
+
+    def __init__(self, max_models: int = 5000):
+        self._lock = threading.Lock()
+        self._models: dict[str, dict] = {}  # ip/cluster -> {level, techniques, ts}
+        self._max = max_models
+
+    def observe(self, target: str, technique: str):
+        """Record an evasion technique observed for a target."""
+        if not target or not technique:
+            return
+        now = time.time()
+        with self._lock:
+            if len(self._models) > self._max:
+                self._models.clear()
+            m = self._models.get(target)
+            if m is None:
+                m = {'level': 0, 'techniques': set(), 'ts': now}
+                self._models[target] = m
+            m['techniques'].add(technique)
+            m['ts'] = now
+            # Classify level: 0=none, 1=VPN, 2=multi-hop/rotation, 3=adaptive
+            techs = m['techniques']
+            if len(techs) >= 5 or any(t in techs for t in
+                    ('cross_protocol', 'fingerprint_randomization', 'stegano')):
+                m['level'] = 3
+            elif len(techs) >= 3 or any(t in techs for t in
+                    ('relay_chain', 'session_graph', 'multi_egress')):
+                m['level'] = 2
+            elif techs:
+                m['level'] = 1
+
+    def level(self, target: str) -> int:
+        """Return adversary level 0-3."""
+        with self._lock:
+            m = self._models.get(target)
+            return m['level'] if m else 0
+
+    def techniques(self, target: str) -> set:
+        with self._lock:
+            m = self._models.get(target)
+            return set(m['techniques']) if m else set()
+
+    def label(self, target: str) -> str:
+        """Human-readable adversary label."""
+        lv = self.level(target)
+        return {0: 'non-adaptive', 1: 'basic-VPN', 2: 'multi-hop/rotation',
+                3: 'adaptive/AI-assisted'}.get(lv, 'unknown')
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {t: {'level': m['level'], 'techniques': list(m['techniques'])}
+                    for t, m in self._models.items()}
+
+_adversary_model = AdversaryModel()
+
+
+# ========================== P23: PROVENANCE TRACKER ==========================
+# Stamps (source, method, conf, ts) on every mv_detail field so every
+# piece of evidence has an auditable provenance trail. This is the
+# "where did this data come from" answer for legal review.
+class ProvenanceTracker:
+    __slots__ = ('_lock', '_trails', '_max')
+
+    def __init__(self, max_trails: int = 10000):
+        self._lock = threading.Lock()
+        self._trails: dict[str, list] = {}  # ip -> list of (field, source, method, conf, ts)
+        self._max = max_trails
+
+    def stamp(self, ip: str, field: str, source: str, method: str = '', conf: float = 0.0):
+        """Record provenance for a field written to mv_detail."""
+        if not ip or not field:
+            return
+        now = time.time()
+        with self._lock:
+            if len(self._trails) > self._max:
+                self._trails.clear()
+            trail = self._trails.get(ip)
+            if trail is None:
+                trail = []
+                self._trails[ip] = trail
+            trail.append({'field': field, 'source': source, 'method': method,
+                          'conf': conf, 'ts': now})
+            if len(trail) > 100:
+                trail[:] = trail[-100:]
+
+    def trail(self, ip: str) -> list:
+        """Return the full provenance trail for an IP."""
+        with self._lock:
+            return list(self._trails.get(ip, []))
+
+    def trail_for_field(self, ip: str, field: str) -> list:
+        """Return provenance entries for a specific field."""
+        with self._lock:
+            return [e for e in self._trails.get(ip, []) if e['field'] == field]
+
+_provenance = ProvenanceTracker()
+
+
+# ========================== P4: LOCAL KEYLOG CAPTURE ==========================
+# Captures TLS session keys on the endpoint via SSLKEYLOG_FILE-style
+# key logging. This is the certainty lever for controlled hosts: it
+# makes tunnel content recoverable at the endpoint without breaking
+# encryption for anyone else. Only works on hosts you control (the
+# monitor is the delivery vehicle). Does NOT decrypt remote traffic.
+class LocalKeylogCapture:
+    """P4: controlled-host TLS key capture. CONSENT-GATED — activates only
+    when KEYLOG_CONSENT.txt exists in the workspace (endpoint-local, opt-in,
+    legally constrained). capture_pre_tunnel_destination maps an outbound
+    TLS flow's JA4+SNI onto the tunnel's entry so the pre-tunnel
+    destination survives masking; ground_truth_confirm links a decrypted
+    flow back to its observed ciphertext, the highest-confidence evidence
+    the pipeline produces."""
+    __slots__ = ('_lock', '_keys', '_max', '_keylog_file', '_consent',
+                 '_consent_path', '_pre_tunnel', '_ground_truth', '_key_file')
+
+    def __init__(self, max_keys: int = 5000):
+        self._lock = threading.Lock()
+        self._keys: list = []  # list of {client_ip, server_ip, ts, key_type}
+        self._max = max_keys
+        self._keylog_file = ''
+        self._consent_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'KEYLOG_CONSENT.txt')
+        self._consent = os.path.exists(self._consent_path)
+        self._pre_tunnel: dict[str, dict] = {}   # remote_ip -> {real_dest, ja4, sni, ts}
+        self._ground_truth: dict[str, dict] = {} # remote_ip -> {confirmed_dest, ts}
+        self._key_file = os.environ.get('SSLKEYLOGFILE', '') or \
+            os.environ.get('SSLKEYLOG_FILE', '')
+        if self._key_file:
+            self._keylog_file = self._key_file
+        if self._consent:
+            _logger.info('LocalKeylogCapture: consent file present, controlled-host '
+                         'key capture ENABLED (%s)', self._consent_path)
+
+    def set_keylog_file(self, path: str):
+        """Set the SSLKEYLOG_FILE path to monitor."""
+        self._keylog_file = path
+
+    def observe(self, client_ip: str, server_ip: str, key_type: str = 'TLS'):
+        """Record a key capture event (when the keylog file grows)."""
+        if not self._consent or not client_ip or not server_ip:
+            return
+        with self._lock:
+            if len(self._keys) > self._max:
+                self._keys = self._keys[-self._max:]
+            self._keys.append({
+                'client_ip': client_ip, 'server_ip': server_ip,
+                'key_type': key_type, 'ts': time.time(),
+            })
+
+    def capture_pre_tunnel_destination(self, remote_ip: str, real_dest: str,
+                                       ja4: str = '', sni: str = ''):
+        """P4.2: the endpoint knows where the pre-tunnel plaintext was
+        headed — record it so the masked flow's true destination is on
+        record even while the tunnel hides it."""
+        if not self._consent or not remote_ip:
+            return
+        with self._lock:
+            self._pre_tunnel[remote_ip] = {
+                'real_dest': real_dest, 'ja4': ja4, 'sni': sni,
+                'ts': time.time()}
+            if len(self._pre_tunnel) > 5000:
+                for k in list(self._pre_tunnel)[:1000]:
+                    self._pre_tunnel.pop(k, None)
+
+    def pre_tunnel_for(self, remote_ip: str) -> dict:
+        with self._lock:
+            return dict(self._pre_tunnel.get(remote_ip, {}))
+
+    def ground_truth_confirm(self, remote_ip: str, confirmed_dest: str):
+        """P4.3: a decrypted flow confirms remote_ip's true destination —
+        ground truth that feeds P16 outcomes and SESSIONS."""
+        if not self._consent or not remote_ip:
+            return
+        with self._lock:
+            self._ground_truth[remote_ip] = {
+                'confirmed_dest': confirmed_dest, 'ts': time.time()}
+        try:
+            SESSIONS.observe(f'groundtruth:{remote_ip}', remote_ip,
+                             ua='keylog-ground-truth')
+        except Exception:
+            pass
+
+    def ground_truth_for(self, remote_ip: str) -> dict:
+        with self._lock:
+            return dict(self._ground_truth.get(remote_ip, {}))
+
+    def decrypt_flow(self, flow: dict) -> dict:
+        """P4.4: decrypt stub — if keys exist for this flow's endpoints and
+        a decryptor (tshark/dpkt) is configured, recover the payload.
+        Returns {} when consent/keys/tooling are absent (the safe path)."""
+        if not self._consent:
+            return {}
+        if not self.has_keys_for(flow.get('src', ''), flow.get('dst', '')):
+            return {}
+        # Stub: payload recovery needs an external TLS decryptor wired to
+        # the keylog file; the flow metadata + key presence is recorded so
+        # ground_truth_confirm can be fed by a cooperating decryptor.
+        return {'decryptable': True, 'keylog': self._keylog_file}
+
+    def has_keys_for(self, client_ip: str, server_ip: str = '') -> bool:
+        """Check if we have captured keys for a given flow."""
+        with self._lock:
+            for k in self._keys:
+                if k['client_ip'] == client_ip and (not server_ip or k['server_ip'] == server_ip):
+                    return True
+            return False
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._keys)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {'total_keys': len(self._keys), 'keylog_file': self._keylog_file,
+                    'consent': self._consent,
+                    'pre_tunnel': len(self._pre_tunnel),
+                    'ground_truth': len(self._ground_truth)}
+
+_keylog = LocalKeylogCapture()
+
+
+# ========================== P7: SA-LINK GRAPH ==========================
+# Source-Address link: two remote IPs contacted by the same local process
+# inside one short window share a SA id. When the SA id recurs across
+# IPs it is an app/protocol binding — evidence that the IPs serve the
+# same client stack.
+class SALinkGraph:
+    __slots__ = ('_lock', '_links')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._links: dict[str, dict] = {}  # sa_id -> {'ips': set, 'procs': set, 'first', 'last'}
+
+    def observe(self, sa_id: str, ip: str, proc: str = ''):
+        if not sa_id or not ip:
+            return
+        now = time.time()
+        with self._lock:
+            rec = self._links.get(sa_id)
+            if rec is None:
+                rec = {'ips': set(), 'procs': set(), 'first': now, 'last': now}
+                self._links[sa_id] = rec
+            rec['ips'].add(ip)
+            rec['last'] = now
+            if proc:
+                rec['procs'].add(proc)
+            if len(self._links) > 20000:
+                for k in list(self._links)[:4000]:
+                    self._links.pop(k, None)
+
+    def items(self):
+        with self._lock:
+            return [(k, {'ips': set(v['ips']), 'procs': set(v['procs']),
+                         'first': v['first'], 'last': v['last']})
+                    for k, v in self._links.items() if len(v['ips']) > 1]
+
+    def links_for(self, ip: str) -> list:
+        with self._lock:
+            return [dict(sa=k, ips=sorted(v['ips']), procs=sorted(v['procs']))
+                    for k, v in self._links.items() if ip in v['ips']]
+
+    def cross_link(self, monitor=None) -> list:
+        """P7.2: MultiVerifier-side structured conflicts — for every SA id
+        spanning >1 IP, compare each IP's verified fields; disagreements
+        are evidence, not noise."""
+        conflicts = []
+        mv = getattr(monitor, 'multiverifier', None) if monitor else None
+        for sa, rec in self.items():
+            ips = sorted(rec['ips'])
+            verdicts = {}
+            for ip in ips:
+                rep = {}
+                try:
+                    rep = (mv._cache.get(ip) or {}) if mv is not None else {}
+                except Exception:
+                    rep = {}
+                cc = (rep.get('consensus_country') or rep.get('cc') or '')
+                kind = (rep.get('provider_kind') or rep.get('kind') or '')
+                verdicts[ip] = {'cc': cc, 'kind': kind}
+            ccs = {v['cc'] for v in verdicts.values() if v['cc']}
+            kinds = {v['kind'] for v in verdicts.values() if v['kind']}
+            if len(ccs) > 1 or len(kinds) > 1:
+                conflicts.append({'sa_id': sa, 'ips': ips,
+                                  'verdicts': verdicts,
+                                  'kind': 'sa_conflict'})
+        return conflicts
+
+
+SALINK_GRAPH = SALinkGraph()
+
+
+# ========================== P9: ONE-WAY FLOW PAIRER ==========================
+# A one-way encrypted flow (send-only, recv-only ACKs) still leaks its
+# partner: the masked sender's packets leave for IP_A, and shortly after,
+# return-path traffic arrives from IP_B. If A is a VPN exit and B is the
+# responder's real address (or the next relay), timing+volume correlation
+# pairs the two directions and recovers the return path.
+class OneWayFlowPairer:
+    __slots__ = ('_lock', '_oneway', '_pairs', '_max')
+
+    def __init__(self, max_flows: int = 20000):
+        self._lock = threading.Lock()
+        self._oneway: dict[str, dict] = {}   # flow_key -> {dir, ip, ts, pkts, owner}
+        self._pairs: list = []               # pending pair records to emit
+        self._max = max_flows
+
+    def observe(self, flow_key: str, remote_ip: str, direction: str,
+                ts: float, owner: dict | None = None):
+        """Record a one-way flow observation. direction 'out' = we only
+        send to remote_ip; 'in' = we only receive from remote_ip."""
+        if not flow_key or not remote_ip:
+            return
+        with self._lock:
+            rec = self._oneway.get(flow_key)
+            if rec is None:
+                rec = {'dir': direction, 'ip': remote_ip, 'ts': ts,
+                       'pkts': 1, 'owner': owner or {}}
+                self._oneway[flow_key] = rec
+            else:
+                rec['pkts'] += 1
+                rec['ts'] = ts
+            if len(self._oneway) > self._max:
+                for k in list(self._oneway)[:2000]:
+                    self._oneway.pop(k, None)
+        self._try_pair(flow_key, remote_ip, direction, ts, owner or {})
+
+    def _try_pair(self, flow_key, remote_ip, direction, ts, owner):
+        """Pair an outbound one-way flow with an inbound one-way flow to a
+        different IP inside 120s — the return path. Runs on both arrival
+        directions so either order pairs."""
+        want = 'in' if direction == 'out' else 'out'
+        with self._lock:
+            for k, rec in self._oneway.items():
+                if k == flow_key or rec['dir'] != want:
+                    continue
+                if rec['ip'] == remote_ip:
+                    continue
+                gap = abs(ts - rec['ts'])
+                if gap > 120.0:
+                    continue
+                if direction == 'out':
+                    pair = {'out_key': flow_key, 'out_ip': remote_ip,
+                            'in_key': k, 'in_ip': rec['ip'],
+                            'gap_s': round(gap, 3), 'ts': ts,
+                            'owner': dict(owner)}
+                else:
+                    pair = {'out_key': k, 'out_ip': rec['ip'],
+                            'in_key': flow_key, 'in_ip': remote_ip,
+                            'gap_s': round(gap, 3), 'ts': ts,
+                            'owner': dict(rec.get('owner') or owner)}
+                self._pairs.append(pair)
+                self._pairs = self._pairs[-500:]
+                break
+
+    def drain(self) -> list:
+        with self._lock:
+            out = list(self._pairs)
+            self._pairs.clear()
+            return out
+
+
+_oneway_pairer = OneWayFlowPairer()
+
+
+# ========================== P19: REPUTATION STORE ==========================
+# Federated reputation records — signed verdicts a cooperating monitor
+# pushed to /federation/reputation. Kept separate from the local graph
+# so a peer's claim is always labeled 'federated', never mistaken for
+# direct observation.
+class ReputationStore:
+    __slots__ = ('_lock', '_recs', '_max')
+
+    def __init__(self, max_recs: int = 20000):
+        self._lock = threading.Lock()
+        self._recs: dict[str, dict] = {}  # ip -> {kind, conf, cc, city, mon, ts}
+        self._max = max_recs
+
+    def put(self, ip: str, rec: dict, monitor_id: str = ''):
+        if not ip:
+            return
+        with self._lock:
+            r = dict(rec)
+            r['mon'] = monitor_id
+            r['ts'] = time.time()
+            old = self._recs.get(ip)
+            if old is not None and old.get('conf', 0) > r.get('conf', 0):
+                # keep the higher-confidence record; a down-grade must be
+                # pushed as a correction with explicit lower conf
+                if r.get('corrects'):
+                    self._recs[ip] = r
+            else:
+                self._recs[ip] = r
+            if len(self._recs) > self._max:
+                for k in list(self._recs)[:4000]:
+                    self._recs.pop(k, None)
+
+    def get(self, ip: str) -> dict:
+        with self._lock:
+            return dict(self._recs.get(ip, {}))
+
+    def federated_conf(self, ip: str) -> float:
+        with self._lock:
+            r = self._recs.get(ip)
+            return float(r.get('conf', 0.0)) if r else 0.0
+
+    def pending_contradictions(self):
+        """Federated records that conflict with the local verdict —
+        resolved in favor of the stronger side inside GraphReasoner."""
+        with self._lock:
+            out = []
+            for ip, rec in self._recs.items():
+                if rec.get('contradicts_local'):
+                    out.append((ip, dict(rec)))
+            return out
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {'records': len(self._recs)}
+
+
+_reputation = ReputationStore()
+
+
+# ========================== P18: ACTIVE PROBER ==========================
+# A bounded queue of active probes the reasoner schedules for clusters
+# that are close-but-not-there (P32 actionability). Probe results feed
+# back as probe_match edges — a TLS cert fetched from an IP can name
+# the operator the way no passive signal can.
+class ActiveProber:
+    __slots__ = ('_lock', '_queue', '_running', '_results', '_monitor')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queue: queue.Queue = queue.Queue(maxsize=500)
+        self._running: set = set()
+        self._results: list = []
+        self._monitor = None
+
+    def set_monitor(self, m):
+        self._monitor = m
+
+    def enqueue(self, ip: str, port: int = 443, kind: str = 'tls_cert',
+                cluster: str = ''):
+        if not ip:
+            return
+        key = f'{ip}:{port}:{kind}'
+        with self._lock:
+            if key in self._running or self._queue.full():
+                return
+            self._running.add(key)
+        try:
+            self._queue.put_nowait((ip, port, kind, cluster))
+        except queue.Full:
+            with self._lock:
+                self._running.discard(key)
+
+    def _worker(self):
+        while True:
+            try:
+                ip, port, kind, cluster = self._queue.get(timeout=2.0)
+            except queue.Empty:
+                continue
+            key = f'{ip}:{port}:{kind}'
+            try:
+                res = self._probe(ip, port, kind)
+                if res:
+                    res['cluster'] = cluster
+                    with self._lock:
+                        self._results.append(res)
+                        self._results = self._results[-400:]
+            finally:
+                with self._lock:
+                    self._running.discard(key)
+
+    def _probe(self, ip: str, port: int, kind: str) -> dict:
+        try:
+            if kind == 'tls_cert':
+                import ssl as _ssl
+                ctx = _ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                with socket.create_connection((ip, port), timeout=4) as s:
+                    with ctx.wrap_socket(s, server_hostname=ip) as ss:
+                        cert = ss.getpeercert(binary_form=True)
+                        der = cert or b''
+                        return {'ip': ip, 'port': port, 'kind': kind,
+                                'sha256': hashlib.sha256(der).hexdigest(),
+                                'ts': time.time()}
+            elif kind == 'rtt':
+                t0 = time.time()
+                try:
+                    socket.create_connection((ip, port), timeout=3).close()
+                except OSError:
+                    return {}
+                return {'ip': ip, 'port': port, 'kind': 'rtt',
+                        'rtt_ms': round((time.time() - t0) * 1000, 2),
+                        'ts': time.time()}
+        except Exception:
+            return {}
+        return {}
+
+    def drain(self) -> list:
+        with self._lock:
+            out = list(self._results)
+            self._results.clear()
+            return out
+
+    def start(self):
+        t = threading.Thread(target=self._worker, daemon=True, name='ActiveProber')
+        t.start()
+        return t
+
+
+_active_prober = ActiveProber()
+
+
+# ========================== module helpers for the reasoner ==========================
+_ACTIVE_MONITOR = None
+_BSSID_LOCATIONS = None  # lazy-loaded bssid_locations.json cache (P33)
+
+
+def _ips_in_text(s: str) -> list:
+    """Extract every IPv4-looking token out of a string."""
+    return re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', str(s))
+
+
+def _fp_diversity_note_cluster(ips: list):
+    """A stable fingerprint seen from many egresses is the inverse of
+    P21's evasion — record it as a 'stable' observation so the diversity
+    tracker doesn't flag legitimate clients."""
+    for ip in ips:
+        try:
+            _fp_diversity.observe(f'stable:{ip}', 'stable')
+        except Exception:
+            pass
+
+
+def _cross_protocol_links(monitor):
+    """P28: process-bound cross-protocol links — two different protocol
+    fingerprints arriving at two IPs from the same local process inside
+    one minute link the IPs at 0.85; behavior-shape matches at 0.7."""
+    links = []
+    try:
+        ch = getattr(monitor, 'conn_history', None) if monitor else None
+        if ch is None:
+            return links
+        recent = ch.get_history()[-3000:]
+    except Exception:
+        return links
+    # group by pid -> {remote_ip: set(ports)} — process-bound means the
+    # same pid talked to both IPs
+    by_proc: dict[int, dict] = {}
+    for h in recent:
+        pid = int(h.get('pid') or 0)
+        rip = h.get('remote_ip', '')
+        if not pid or not rip or not _is_public_ip_cached(rip):
+            continue
+        by_proc.setdefault(pid, {}).setdefault(rip, set()).add(
+            int(h.get('remote_port') or 0))
+    for pid, ips in by_proc.items():
+        pname = str(pid)
+        try:
+            prof = getattr(monitor, 'process_profiles', {}).get(pid)
+            pname = getattr(prof, 'name', None) or str(pid)
+        except Exception:
+            pass
+        il = sorted(ips)
+        for i in range(len(il)):
+            for j in range(i + 1, len(il)):
+                ports = ips[il[i]] | ips[il[j]]
+                if len(ports) >= 2:
+                    links.append((il[i], il[j], 0.85,
+                                  f'process-bound:{pname}'))
+                else:
+                    links.append((il[i], il[j], 0.7,
+                                  f'cross_protocol_behavior:{pname}'))
+    return links
+
+
+def _spectrum_medium_events(monitor):
+    """P5: derive CROSS_MEDIUM_REAPPEARANCE / WIRELESS_BYPASS_DEVICE from
+    SpectrumHub — a device seen on wireless only, or reappearing on a
+    different medium while a tunnel is up, is bypass evidence."""
+    events = []
+    try:
+        hub = getattr(monitor, 'spectrum', None) if monitor else None
+        if hub is None:
+            return events
+        emitters = getattr(getattr(hub, 'registry', hub), 'emitters', {}) or {}
+        registry = getattr(hub, 'device_registry', {}) or {}
+    except Exception:
+        return events
+    wireless_only = set(getattr(hub, 'wireless_only_devices', set()))
+    mediums: dict[str, set] = {}
+    _WIRELESS = ('wifi', 'wifi-ap', 'wifi-radio', 'wifi-direct',
+                 'bt', 'bt-classic', 'bt-radio', 'ble', 'rf', 'wwan')
+    _WIRED = ('wired', 'l2-wire', 'local-iface', 'ethernet')
+    for key, e in emitters.items():
+        addr = e.get('address', '') or key
+        med = (e.get('medium') or '').lower()
+        # normalize to wireless/wired/other
+        fam = ('wireless' if any(w in med for w in _WIRELESS) else
+               'wired' if any(w in med for w in _WIRED) else 'other')
+        mediums.setdefault(addr, set()).add(fam)
+        if fam == 'wireless':
+            wireless_only.add(addr)
+    for addr, meds in mediums.items():
+        if 'wireless' in meds and 'wired' in meds:
+            events.append({'category': 'CROSS_MEDIUM_REAPPEARANCE',
+                           'severity': 'HIGH',
+                           'address': addr,
+                           'msg': f"device {addr} observed on "
+                                  f"{sorted(meds)} — same device on multiple media",
+                           'evidence': [f"mediums: {sorted(meds)}",
+                                        f"address: {addr}"],
+                           'conf': 0.9, 'peers': []})
+    for addr in sorted(wireless_only):
+        if mediums.get(addr, set()) <= {'wireless'}:
+            events.append({'category': 'WIRELESS_BYPASS_DEVICE',
+                           'severity': 'MEDIUM',
+                           'address': addr,
+                           'msg': f"device {addr} seen only on wireless "
+                                  f"mediums — potential wired-VPN bypass",
+                           'evidence': [f"mediums: {sorted(mediums[addr])}"],
+                           'conf': 0.7, 'peers': []})
+    try:
+        if hub is not None:
+            hub.wireless_only_devices = set(wireless_only)
+    except Exception:
+        pass
+    return events
 
 
 def get_vendor(mac: str) -> str:
@@ -2736,23 +6035,47 @@ class DNSCache:
                 for k in list(d)[: self._MAX_MAP_ENTRIES // 4]:
                     d.pop(k, None)
 
-    def process_packet(self, pkt):
-        if not pkt.haslayer(DNS):
-            return
-        dns_layer = pkt[DNS]
-        if dns_layer.qr == 1 and dns_layer.ancount > 0:
+    def process_packet(self, pkt, dns_layer=None, src_ip=None):
+        """Record DNS answers/queries. Callers that already walked the
+        layer chain pass (dns_layer, src_ip) — saves the pkt.haslayer /
+        pkt[DNS] / pkt[IP] re-walks and the getfieldval do_copy clone
+        per accessor; we read the raw .fields dict throughout."""
+        if dns_layer is None:
+            if not pkt.haslayer(DNS):
+                return
+            dns_layer = pkt[DNS]
+        _f = getattr(dns_layer, 'fields', None) or {}
+        qr = int(_f.get('qr', 0) or 0)
+        ancount = int(_f.get('ancount', 0) or 0)
+        _qd = _f.get('qd')
+        if isinstance(_qd, (list, tuple)):
+            _qd = _qd[0] if _qd else None
+        _qn = (getattr(_qd, 'fields', {}).get('qname')
+               if _qd is not None else None)
+        if _qn is None and _qd is not None:
+            _qn = getattr(_qd, 'qname', b'')
+        qname = (_qn.decode(errors='ignore')
+                 if isinstance(_qn, (bytes, bytearray))
+                 else str(_qn or '')).rstrip('.')
+        if qr == 1 and ancount > 0:
             try:
-                qname = dns_layer.qd.qname.decode(errors='ignore').rstrip('.')
-                rr = dns_layer.an
+                an = _f.get('an')
+                if isinstance(an, (list, tuple)):
+                    rr = an[0] if an else None
+                else:
+                    rr = an
                 # Collect first, apply under ONE lock — an answer can carry
                 # up to 30 RRs and taking the lock per record was 30
                 # acquisitions per response.
                 new_pairs = []
-                for _ in range(min(dns_layer.ancount, 30)):
+                for _ in range(min(ancount, 30)):
                     if rr is None:
                         break
-                    if hasattr(rr, 'rdata'):
-                        ip_str = str(rr.rdata)
+                    rdata = getattr(rr, 'fields', {}).get('rdata')
+                    if rdata is None:
+                        rdata = getattr(rr, 'rdata', None)
+                    if rdata is not None:
+                        ip_str = str(rdata)
                         try:
                             ipaddress.ip_address(ip_str)
                             new_pairs.append((ip_str, qname))
@@ -2770,10 +6093,9 @@ class DNSCache:
                         self._bound_maps()
             except Exception as exc:
                 _logger.debug("DNS response parse error: %s", exc)
-        elif dns_layer.qr == 0:
+        elif qr == 0:
             try:
-                qname = dns_layer.qd.qname.decode(errors='ignore').rstrip('.')
-                src = pkt[IP].src if pkt.haslayer(IP) else "?"
+                src = src_ip or (pkt[IP].src if pkt.haslayer(IP) else "?")
                 with self.lock:
                     self.query_log.append((time.time(), src, qname))
                     self.q_seq += 1
@@ -3497,6 +6819,115 @@ class JA4Plus:
         except Exception as exc:
             _logger.debug("JA4X hash error: %s", exc)
             return None
+
+
+# ---------- P0.1: composite client fingerprint ----------
+def compute_client_fp(ja4=None, ja4s=None, ja4h=None, ja4x=None,
+                      ua='', h2_settings=None) -> str:
+    """Composite client fingerprint (P0.1). Concatenate the non-empty JA4+
+    components with '|', sha256, take 24 hex chars. Hashed so the raw
+    fingerprint components are never stored in plaintext logs."""
+    parts = [str(v) for v in (ja4, ja4s, ja4h, ja4x, ua, h2_settings) if v]
+    return hashlib.sha256('|'.join(parts).encode()).hexdigest()[:24]
+
+
+def parse_h2_settings(pkt) -> Optional[str]:
+    """Extract the HTTP/2 SETTINGS frame payload bytes from a TLS appdata
+    record and hash them to 8 hex chars (P0.1 sibling). Returns None when
+    the payload carries no recognizable H2 SETTINGS preface/frame."""
+    try:
+        if not (pkt.haslayer(TCP) and pkt.haslayer(Raw)):
+            return None
+        data = bytes(pkt[Raw])
+        # H2 client preface inside appdata, or a bare SETTINGS frame
+        # (type 0x04, no ACK flag) riding an appdata record.
+        idx = data.find(b'PRI * HTTP/2.0')
+        if idx < 0:
+            i = 0
+            while i + 9 <= len(data):
+                if data[i] == 0x17:  # TLS appdata record
+                    rlen = int.from_bytes(data[i + 3:i + 5], 'big')
+                    rec = data[i + 5:i + 5 + rlen]
+                    if len(rec) >= 9 and rec[3] == 0x04 and rec[4] == 0x00:
+                        return hashlib.sha256(rec[9:]).hexdigest()[:8]
+                    i += 5 + rlen
+                else:
+                    break
+            return None
+        tail = data[idx + 14:]
+        if len(tail) >= 9 and tail[3] == 0x04:
+            return hashlib.sha256(tail[9:]).hexdigest()[:8]
+        return None
+    except Exception:
+        return None
+
+
+# ---------- P15.1: behavioral flow fingerprint ----------
+def behavior_fp(gaps_ms: list, sizes: list, direction_ratio: float,
+                duration_s: float, byte_rate: float) -> str:
+    """Hash a flow's behavioral shape to 16 hex (P15.1): inter-packet-IQR
+    band, size mode, size IQR band, direction-ratio band, duration band,
+    byte-rate band. Two flows from the same beaconing malware (same
+    interval, sizes, direction) produce the same hash."""
+    def _iqr_band(v):
+        if len(v) < 4:
+            return 0
+        s = sorted(v)
+        q1, q3 = s[len(s) // 4], s[(3 * len(s)) // 4]
+        iqr = q3 - q1
+        for band, edge in enumerate(
+                (1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 20000)):
+            if iqr <= edge:
+                return band
+        return 12
+    size_mode = 0
+    if sizes:
+        from collections import Counter as _C
+        size_mode = _C(sizes).most_common(1)[0][0]
+    for band, edge in enumerate(
+            (0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95)):
+        if direction_ratio <= edge:
+            d_band = band
+            break
+    else:
+        d_band = 7
+    for band, edge in enumerate((0.5, 2, 10, 60, 300, 1800, 7200)):
+        if duration_s <= edge:
+            dur_band = band
+            break
+    else:
+        dur_band = 7
+    for band, edge in enumerate((64, 512, 4096, 65536, 524288, 4194304)):
+        if byte_rate <= edge:
+            br_band = band
+            break
+    else:
+        br_band = 6
+    key = f"{_iqr_band(gaps_ms)}:{size_mode}:{_iqr_band(sizes)}:{d_band}:{dur_band}:{br_band}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+# ---------- P22.1: session-graph shape hash ----------
+def session_graph_hash(ts_list: list, sizes: list, dirs: list) -> str:
+    """Hash a session's shape (P22.1): sort packet events by
+    (direction, size_bucket, time_bucket) then hash the label sequence —
+    graph-isomorphism-stable, so two flows with the same conversation
+    shape produce the same 16-hex hash regardless of packet order."""
+    if not ts_list:
+        return ''
+    t0 = min(ts_list)
+    events = []
+    for i, t in enumerate(ts_list):
+        sz = sizes[i] if i < len(sizes) else 0
+        dr = dirs[i] if i < len(dirs) else 0
+        sb = 0 if sz <= 64 else (1 if sz <= 256 else (
+            2 if sz <= 576 else (3 if sz <= 1200 else (
+                4 if sz <= 1460 else 5))))
+        tb = int((t - t0) * 4)  # 250ms time buckets
+        events.append((1 if dr else 0, sb, tb))
+    events.sort()
+    canon = ';'.join(f"{d}:{s}:{t}" for d, s, t in events[:64])
+    return hashlib.sha256(canon.encode()).hexdigest()[:16]
 
 
 # ========================== VIRUSTOTAL INTEGRATION ==========================
@@ -4307,45 +7738,10 @@ class HostsFileMonitor:
             except Exception:
                 pass
             return servers
-        # Registry read — the same source ipconfig /all reports, but an
-        # in-process enumeration instead of a subprocess spawn every cycle.
-        servers = set()
-        try:
-            with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces',
-                    0, winreg.KEY_READ) as k:
-                i = 0
-                while True:
-                    try:
-                        sub = winreg.EnumKey(k, i)
-                        i += 1
-                    except OSError:
-                        break
-                    try:
-                        with winreg.OpenKey(k, sub, 0, winreg.KEY_READ) as sk:
-                            for vn in ('NameServer', 'DhcpNameServer'):
-                                try:
-                                    raw, _ = winreg.QueryValueEx(sk, vn)
-                                except (OSError, FileNotFoundError):
-                                    continue
-                                for tok in re.split(r'[\s,;]+', str(raw)):
-                                    tok = tok.strip()
-                                    if tok and tok != '127.0.0.1':
-                                        try:
-                                            ipaddress.ip_address(tok)
-                                            servers.add(tok)
-                                        except ValueError:
-                                            pass
-                    except OSError:
-                        continue
-            return servers
-        except Exception:
-            pass
-        # Fallback: ipconfig /all
         try:
             out = subprocess.run(['ipconfig', '/all'], capture_output=True,
                                  text=True, timeout=10)
+            servers = set()
             for line in out.stdout.split('\n'):
                 if 'DNS Servers' in line:
                     parts = line.split(':')
@@ -4410,45 +7806,6 @@ class ServiceMonitor:
                 return services
             except Exception:
                 return {}
-        # Registry enumeration — every service key carries DisplayName +
-        # ImagePath, so one in-process pass replaces the 'sc query' spawn
-        # (and the per-service 'sc qc' spawns below).
-        services = {}
-        binpaths = {}
-        try:
-            with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r'SYSTEM\CurrentControlSet\Services', 0,
-                    winreg.KEY_READ) as k:
-                i = 0
-                while True:
-                    try:
-                        svc_name = winreg.EnumKey(k, i)
-                        i += 1
-                    except OSError:
-                        break
-                    try:
-                        with winreg.OpenKey(k, svc_name, 0,
-                                            winreg.KEY_READ) as sk:
-                            try:
-                                disp, _ = winreg.QueryValueEx(sk, 'DisplayName')
-                                services[svc_name] = disp
-                            except (OSError, FileNotFoundError):
-                                services[svc_name] = svc_name
-                            try:
-                                img, _ = winreg.QueryValueEx(sk, 'ImagePath')
-                                if img:
-                                    binpaths[svc_name] = os.path.expandvars(
-                                        str(img)).strip('"')
-                            except (OSError, FileNotFoundError):
-                                pass
-                    except OSError:
-                        continue
-        except Exception:
-            pass
-        if services:
-            self._svc_binpaths = binpaths
-            return services
         try:
             out = subprocess.run(
                 ['sc', 'query', 'type=', 'service', 'state=', 'all'],
@@ -4474,11 +7831,6 @@ class ServiceMonitor:
                 return out.stdout.strip()
             except Exception:
                 return ''
-        # Harvested during the same registry pass as _get_services —
-        # 'sc qc' only runs now when the enumeration itself failed.
-        binpaths = getattr(self, '_svc_binpaths', None)
-        if binpaths is not None:
-            return binpaths.get(svc, '')
         try:
             out = subprocess.run(['sc', 'qc', svc], capture_output=True,
                                  text=True, timeout=5)
@@ -4524,59 +7876,16 @@ class SecurityToolMonitor:
         self._first_run = True
 
     def _check_defender(self) -> bool:
-        # Registry fast-path — catches the direct-tamper case (malware sets
-        # these to 1) instantly with zero subprocess cost.
-        try:
-            for path, val in (
-                (r'SOFTWARE\Microsoft\Windows Defender\Real-Time Protection',
-                 'DisableRealtimeMonitoring'),
-                (r'SOFTWARE\Microsoft\Windows Defender', 'DisableAntiSpyware'),
-                (r'SOFTWARE\Microsoft\Windows Defender', 'DisableAntiVirus'),
-            ):
-                try:
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0,
-                                        winreg.KEY_READ) as k:
-                        v, _ = winreg.QueryValueEx(k, val)
-                    if v:
-                        return False
-                except (OSError, FileNotFoundError):
-                    continue
-        except Exception:
-            pass
-        # Authoritative source (third-party-AV takeovers don't set the
-        # flags above): Get-MpComputerStatus — but PowerShell costs
-        # ~0.5-1.5s per spawn, so run it only every 4th scan and ride the
-        # cached verdict between runs.
-        self._defender_probe_n = getattr(self, '_defender_probe_n', 0) + 1
-        if self._defender_probe_n % 4 != 1 and hasattr(
-                self, '_defender_wmi_state'):
-            return self._defender_wmi_state
         try:
             out = subprocess.run(
-                ['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                ['powershell', '-Command',
                  'Get-MpComputerStatus | Select-Object -Property RealTimeProtectionEnabled'],
                 capture_output=True, text=True, timeout=10)
-            self._defender_wmi_state = 'True' in out.stdout
-            return self._defender_wmi_state
+            return 'True' in out.stdout
         except Exception:
-            return getattr(self, '_defender_wmi_state', True)
+            return True
 
     def _check_firewall(self) -> bool:
-        # EnableFirewall DWORD per profile — the same source netsh reads,
-        # minus the ~0.5-1s netsh spawn every cycle.
-        try:
-            states = []
-            for prof in ('DomainProfile', 'StandardProfile', 'PublicProfile'):
-                with winreg.OpenKey(
-                        winreg.HKEY_LOCAL_MACHINE,
-                        'SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\'
-                        'Parameters\\FirewallPolicy\\' + prof,
-                        0, winreg.KEY_READ) as k:
-                    v, _ = winreg.QueryValueEx(k, 'EnableFirewall')
-                    states.append(bool(v))
-            return all(states) if states else True
-        except Exception:
-            pass
         try:
             out = subprocess.run(
                 ['netsh', 'advfirewall', 'show', 'allprofiles', 'state'],
@@ -6474,6 +9783,11 @@ class SpectrumHub:
         self._scan_cycle = 0
         self._evil_last: dict[str, float] = {}
         self._hw_sig = ''
+        # P5: cross-medium device registry — logical device name -> set of
+        # (medium, address) pairs the device has been observed on, so a
+        # device reappearing on a different medium is linkable.
+        self.device_registry: dict[str, set] = {}
+        self.wireless_only_devices: set = set()
         self.lock = threading.RLock()
         self._sensors: dict[str, dict] = {}
         for s in CONFIG.get('rf_sensors') or []:
@@ -8628,6 +11942,58 @@ _VPN_SERVER_PORTS = {
 }
 
 
+# ========================== P33: GEO FUSION ==========================
+# Fuses all collected location sources into one weighted estimate.
+# Tighter sources (WiFi BSSID, STUN reflexive) dominate; loose sources
+# (timezone, locale, CDN edge) are down-weighted. Produces a single
+# (lat, lon, radius_km, conf, sources_used) tagged MV-GEOFUSED.
+class GeoFuser:
+    __slots__ = ()
+
+    def fuse(self, sources: list) -> dict:
+        """sources: list of {lat, lon, radius_km, conf, source_name}.
+        Returns fused {lat, lon, radius_km, conf, sources_used, geo_source}."""
+        if not sources:
+            return {}
+        # Weight = conf / radius_km (tighter + more confident = higher weight)
+        wsum = 0.0
+        wlat = 0.0
+        wlon = 0.0
+        used = []
+        for s in sources:
+            lat, lon = s.get('lat', 0), s.get('lon', 0)
+            r = max(0.1, s.get('radius_km', 100))
+            c = s.get('conf', 0.5)
+            if not lat and not lon:
+                continue
+            w = c / r
+            wsum += w
+            wlat += lat * w
+            wlon += lon * w
+            used.append(s.get('source_name', '?'))
+        if wsum == 0:
+            return {}
+        flat, flon = wlat / wsum, wlon / wsum
+        # Fused radius = max distance from centroid to any source's circle edge
+        max_r = 0.0
+        for s in sources:
+            lat, lon = s.get('lat', 0), s.get('lon', 0)
+            if not lat and not lon:
+                continue
+            d = _haversine_km(flat, flon, lat, lon)
+            r = s.get('radius_km', 100)
+            max_r = max(max_r, d + r)
+        # Fused confidence = weighted average of source confidences
+        fconf = min(0.99, sum(s.get('conf', 0.5) * s.get('conf', 0.5) / max(0.1, s.get('radius_km', 100)) for s in sources) / wsum)
+        return {
+            'lat': round(flat, 4), 'lon': round(flon, 4),
+            'radius_km': round(max_r, 1), 'conf': round(fconf, 3),
+            'sources_used': used, 'geo_source': 'MV-GEOFUSED',
+        }
+
+_geofuser = GeoFuser()
+
+
 class MultiVerifier:
     """Cross-verifies an endpoint's location and nature with many independent
     methods, then fuses them into a consensus + confidence + conflict report.
@@ -9520,7 +12886,9 @@ class MultiVerifier:
                 except Exception:
                     pass
             mile.append({'hop': ttl, 'ip': hip, 'cc': cc,
-                         'city': city, 'rdns': rdns, 'rtt': hrtt})
+                         'city': city, 'rdns': rdns, 'rtt': hrtt,
+                         'lat': hg.get('lat', 0.0) or 0.0,
+                         'lon': hg.get('lon', 0.0) or 0.0})
         if mile:
             report['last_mile'] = mile
             nearest = mile[-1]
@@ -11951,6 +15319,7 @@ class MultiVerifier:
             bhost = next((b.get('host') for b in bn if b.get('host')), '')
             report['banner_os'] = bos
             report['banner_host'] = bhost
+            oses = {b['os'] for b in bn if b.get('os')}
             det = '; '.join(f"{b['port']}/{b['proto']}: {b['banner'][:48]}"
                             for b in bn[:3])
             # OS triple-check — banner vs ping TTL vs passive TCPFP.
@@ -13730,6 +17099,26 @@ class MultiVerifier:
             if near2.get('cc') and near2['cc'] != consensus:
                 srv_city, srv_cc = near2.get('city', ''), near2['cc']
                 srv_src = f"last-mile hop{near2.get('hop','?')} {near2['ip']}"
+        # P8.1: coordinates for the serving point — a geolocated
+        # last-mile router in the serving country carries real lat/lon;
+        # an IATA PoP resolves to city+cc only, so fall back to the
+        # country centroid with a wide (honest) radius.
+        srv_lat = srv_lon = 0.0
+        srv_rad = 0.0
+        if srv_cc:
+            geo_hops = [h for h in (report.get('last_mile') or [])
+                        if h.get('cc') == srv_cc and (h.get('lat') or h.get('lon'))]
+            if geo_hops:
+                nearest_g = max(geo_hops, key=lambda h: h.get('hop', 0))
+                srv_lat, srv_lon = nearest_g['lat'], nearest_g['lon']
+                srv_rad = 25.0   # last-mile router = same-metro estimate
+            elif srv_cc in _COUNTRY_CENTROIDS:
+                srv_lat, srv_lon = _COUNTRY_CENTROIDS[srv_cc]
+                srv_rad = 200.0  # country-level only — honest, not PoP-tight
+        if srv_lat or srv_lon:
+            report['serving_lat'] = srv_lat
+            report['serving_lon'] = srv_lon
+            report['serving_radius_km'] = srv_rad
         if srv_cc and consensus and srv_cc != consensus:
             report['serving_city'] = srv_city
             report['serving_cc'] = srv_cc
@@ -13824,6 +17213,14 @@ class MultiVerifier:
         self._fuse_vpn(report)
         # ---------- narrative summary ----------
         report['summary'] = self._summarize(report)
+        # P7: structured conflicts — each disagreement preserved as a
+        # record, not flattened to a string.
+        try:
+            report['conflict_objs'] = [
+                {'detail': str(c)[:200], 'ip': ip, 'ts': time.time()}
+                for c in report.get('conflicts', [])]
+        except Exception:
+            report['conflict_objs'] = []
 
         with self._lock:
             if len(self._cache) < 5000:
@@ -13833,6 +17230,14 @@ class MultiVerifier:
             self._last_coherence_sweep = now
             self._coherence_sweep()
         return report
+
+    def cross_link(self, monitor=None) -> list:
+        """P7.3: structured cross-IP conflicts — SA-link groups whose
+        members' verified verdicts disagree (P7.2 feed)."""
+        try:
+            return SALINK_GRAPH.cross_link(monitor or _ACTIVE_MONITOR)
+        except Exception:
+            return []
 
     def _coherence_sweep(self):
         """Cross-endpoint coherence: within one claimed city, the MINIMUM
@@ -18871,18 +22276,30 @@ class MultiVerifier:
                 report['consensus_city'] = ccity.title()
             elif report['lat'] or report['lon']:
                 report['consensus_city'] = ccity.title()  # single-source, still show
+        # P7: weighted fusion — replace flat-vote with weighted vote.
+        # Strong methods (Tier 3: TLS, RDAP, RIPE, EDGE, GEOFEED) count
+        # more than weak methods (Tier 1: TTL, MSS, TCPFP). This makes
+        # the consensus reflect evidence quality, not just count.
         confidence = int(round(agree / total * 100)) if total else 0
         report['confidence'] = confidence
+        try:
+            w_winner, w_conf, w_conflicts = _weighted_vote(cc_votes, report['methods'])
+            if w_winner:
+                report['consensus_country'] = w_winner
+                confidence = int(round(w_conf))
+                report['confidence'] = confidence
+                if w_conflicts:
+                    report['conflicts'].extend(w_conflicts)
+        except Exception:
+            pass
         # mark per-method agreement/conflict + record conflicts
         for m in report['methods']:
             if not m.get('cc'):
                 continue
-            if m['cc'] == winner:
+            if m['cc'] == report.get('consensus_country', winner):
                 m['status'] = 'ok'
             else:
                 m['status'] = 'conflict'
-                report['conflicts'].append(
-                    f"{m['name']} says {m['cc']} vs consensus {winner}")
         # grade
         if total == 1:
             report['grade'] = 'SINGLE-SOURCE'
@@ -22025,12 +25442,18 @@ class SIEMOutput:
 
     @staticmethod
     def _record(d: Deduction) -> dict:
-        return {
+        rec = {
             'timestamp': datetime.datetime.fromtimestamp(d.timestamp).isoformat(),
             'severity': d.severity, 'category': d.category,
             'process': d.process_name, 'pid': d.pid,
             'message': d.message, 'evidence': d.evidence, 'score': d.score,
         }
+        # §8.8.K.7: downstream SIEM gets the full evidence — attach the
+        # collected mv_detail when the emitting site provided it.
+        md = getattr(d, 'mv_detail', None)
+        if md:
+            rec['mv_detail'] = md
+        return rec
 
     def _emit_http(self, d: Deduction, fmt: str):
         url, token = CONFIG.get('siem_url', ''), CONFIG.get('siem_token', '')
@@ -22136,11 +25559,11 @@ class _HttpPoster:
             url, body, headers = self._q.get()
             for attempt in (0, 1):
                 try:
-                    # Shared keep-alive session — a fresh urllib connection
-                    # (DNS + TCP + TLS handshake) per posted event before.
-                    _HTTP_SESSION.post(
-                        url, data=body, timeout=10,
+                    req = urllib.request.Request(
+                        url, data=body, method='POST',
                         headers={'Content-Type': 'application/json', **headers})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        resp.read(1024)
                     self.sent += 1
                     break
                 except Exception as exc:
@@ -22238,8 +25661,10 @@ class WebhookAlerter:
             req.add_header('Priority', '5' if severity == 'CRITICAL' else '3')
             req.add_header('Tags', 'rotating_light' if severity == 'CRITICAL'
                            else 'warning')
-            hdrs = dict(req.header_items())
-            _HTTP_SESSION.post(url, data=req.data, headers=hdrs, timeout=10)
+            tok = CONFIG.get('alert_ntfy_token')
+            if tok:
+                req.add_header('Authorization', 'Bearer ' + str(tok))
+            urllib.request.urlopen(req, timeout=10)
         except Exception as exc:
             _logger.debug("ntfy push failed: %s", exc)
 
@@ -23541,9 +26966,7 @@ def _system_dns_servers() -> list:
     return list(out)
 
 
-def _dns_skip_name_fast(buf: bytes, off: int) -> int:
-    """Skip a DNS name; raises IndexError on malformed/truncated data
-    (callers rely on exception flow rather than a -1 sentinel)."""
+def _dns_skip_name(buf: bytes, off: int) -> int:
     while True:
         n = buf[off]
         if n == 0:
@@ -23583,10 +27006,10 @@ def dns_txt_query(name: str, servers: Optional[list] = None, timeout: float = 2.
             qd, an = struct.unpack('!HH', data[4:8])
             off = 12
             for _ in range(qd):
-                off = _dns_skip_name_fast(data, off) + 4
+                off = _dns_skip_name(data, off) + 4
             out = []
             for _ in range(an):
-                off = _dns_skip_name_fast(data, off)
+                off = _dns_skip_name(data, off)
                 rtype, _cls, _ttl, rdlen = struct.unpack('!HHIH', data[off:off + 10])
                 off += 10
                 rd = data[off:off + rdlen]
@@ -23923,7 +27346,8 @@ class ProviderRangeDB:
     def _cfg_ttl(self) -> float:
         return self._ttl or CONFIG.get('attribution_provider_ranges_ttl_s', 86400)
 
-    def _add(self, cidr: str, provider: str, service: str, region: str, prio: int = 2) -> bool:
+    def _add(self, cidr: str, provider: str, service: str, region: str,
+             prio: int = 2, kind: str = '') -> bool:
         try:
             net = ipaddress.ip_network(cidr, strict=False)
         except ValueError:
@@ -23934,7 +27358,8 @@ class ProviderRangeDB:
         old = bucket.get(key)
         if old is not None and old['prio'] >= prio:
             return False
-        bucket[key] = {'provider': provider, 'service': service, 'region': region, 'prio': prio}
+        bucket[key] = {'provider': provider, 'service': service,
+                       'region': region, 'prio': prio, 'kind': kind}
         if pl not in self._lens[v]:
             self._lens[v] = sorted(self._lens[v] + [pl], reverse=True)
         return True
@@ -23997,8 +27422,12 @@ class ProviderRangeDB:
                     label = 'Fastly edge'
                 if reg and reg.upper() != 'GLOBAL':
                     label += f" ({reg})"
-                return {'provider': prov, 'service': svc, 'region': reg, 'label': label,
-                        'category': 'CDN' if cdn else ('Dev' if prov == 'GitHub' else 'Cloud/Hosting')}
+                kind = hit.get('kind', '')
+                cat = ('VPN' if kind == 'vpn' else
+                       'CDN' if cdn else
+                       ('Dev' if prov == 'GitHub' else 'Cloud/Hosting'))
+                return {'provider': prov, 'service': svc, 'region': reg,
+                        'kind': kind, 'label': label, 'category': cat}
         return None
 
     def load_disk(self) -> bool:
@@ -24013,9 +27442,37 @@ class ProviderRangeDB:
         except Exception:
             return False
 
+    def ingest_vpn_ranges(self, data) -> int:
+        """P0/P1: ingest vpn_ranges.json — {provider: [cidr,...]} or
+        [{provider, cidr}] — tagged kind='vpn' so lookup() returns
+        category='VPN' and SESSIONS.confirm_vpn_cluster can confirm."""
+        n = 0
+        try:
+            if isinstance(data, dict):
+                for prov, cidrs in data.items():
+                    for c in cidrs or []:
+                        n += self._add(c, prov, 'exit', '', 1, kind='vpn')
+            elif isinstance(data, list):
+                for row in data:
+                    n += self._add(row.get('cidr', ''), row.get('provider', 'VPN'),
+                                   'exit', '', 1, kind='vpn')
+        except (AttributeError, TypeError):
+            pass
+        self.count += n
+        return n
+
+    def load_vpn_disk(self, path: str = '') -> int:
+        """Load vpn_ranges.json from disk; missing file is not an error."""
+        try:
+            with open(path or CONFIG.get('attribution_vpn_ranges_file',
+                                         'vpn_ranges.json'), encoding='utf-8') as fh:
+                return self.ingest_vpn_ranges(json.load(fh))
+        except Exception:
+            return 0
+
     def _save_disk(self) -> None:
         try:
-            rows = [[f"{ipaddress.ip_address(k)}/{pl}", m['provider'], m['service'], m['region'], m['prio']]
+            rows = [[f"{ipaddress.ip_address(k)}/{pl}", m['provider'], m['service'], m['region'], m['prio'], m.get('kind', '')]
                     for v in (4, 6) for pl, b in self._nets[v].items() for k, m in b.items()]
             tmp = self._cfg_path() + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as fh:
@@ -24038,6 +27495,7 @@ class ProviderRangeDB:
 
     def _bg(self):
         self.load_disk()
+        self.load_vpn_disk()
         if time.time() - self._ts >= self._cfg_ttl() and CONFIG.get('geoip_enabled', True):
             self.refresh()
 
@@ -26337,6 +29795,42 @@ class SessionRegistry:
                                 'ua': rec['ua'], 'n': rec['n']})
         return out
 
+    def alert_multi_egress(self) -> list:
+        """P0.4: every fingerprint seen from >1 distinct public IP — the
+        multi-egress signature. Returns [{'fp', 'ips', 'ua', 'first',
+        'last', 'n'}]."""
+        out = []
+        with self.lock:
+            for h, rec in self.fp.items():
+                pubs = [i for i in rec['ips'] if _is_public_ip_cached(i)]
+                if len(pubs) >= 2:
+                    out.append({'fp': h, 'ips': sorted(pubs),
+                                'ua': rec['ua'], 'first': rec['first'],
+                                'last': rec['last'], 'n': rec['n']})
+        return sorted(out, key=lambda r: -len(r['ips']))
+
+    def confirm_vpn_cluster(self, range_db=None) -> list:
+        """P0.4: subset of multi-egress alerts where at least one egress
+        resolves to a known VPN/hosting range — the confirmed-VPN
+        correlation."""
+        rdb = range_db or (PROVIDER_RANGES if 'PROVIDER_RANGES' in globals() else None)
+        out = []
+        for rec in self.alert_multi_egress():
+            vpn_hit = False
+            if rdb is not None:
+                for ip in rec['ips']:
+                    try:
+                        info = rdb.lookup(ip)
+                        if info and str(info.get('category', '')).lower() in (
+                                'vpn', 'hosting', 'cloud/hosting', 'dev'):
+                            vpn_hit = True
+                            break
+                    except Exception:
+                        pass
+            if vpn_hit:
+                out.append(rec)
+        return out
+
 
 SESSIONS = SessionRegistry()
 
@@ -26426,6 +29920,41 @@ class FlowCorrelator:
         with self.lock:
             return [m for m in self.matches if ip in (m.get('flow', ''), m.get('wm', ''))]
 
+    # ---------- P3: injection + pacing ----------
+    def inject_into_flow(self, flow_key: str, target: str = '',
+                         note: str = '') -> dict:
+        """P3.1: mint a watermark bound to an observed flow — the gap
+        schedule the /w/<tok> responder paces its bursts on. Returns the
+        schedule and its confidence tag."""
+        wm_id = f"{flow_key}:{int(time.time())}"
+        gaps = self.inject(wm_id, target=target or flow_key, note=note)
+        return {'wm_id': wm_id, 'gaps_ms': gaps, 'flow': flow_key,
+                'conf': 0.7}
+
+    def pace_advice(self, flow_id: str) -> dict:
+        """P3.2: the pacing a sender should use to carry an injected
+        watermark — the stored schedule for flow_id's newest pattern,
+        or the schedule we'd mint now."""
+        with self.lock:
+            pat = self.patterns.get(flow_id)
+            if pat is None:
+                # find the newest pattern bound to this flow
+                for wid, rec in reversed(list(self.patterns.items())):
+                    if rec.get('target') == flow_id or flow_id in wid:
+                        pat = rec
+                        break
+            gaps = list(pat['gaps']) if pat else _wm_gaps(flow_id)
+        return {'flow': flow_id, 'gaps_ms': gaps,
+                'note': 'pace outbound bursts on these ms gaps'}
+
+    def confidence_tag(self, match: dict) -> dict:
+        """P3.3: tag a watermark match with a confidence label for the
+        evidence graph — a matched flow is a same-flow assertion."""
+        m = dict(match)
+        m['confidence'] = round(m.get('score', 0.0), 3)
+        m['kind'] = 'watermark_relay'
+        return m
+
 
 FLOWCORR = FlowCorrelator()
 
@@ -26459,16 +29988,16 @@ def _demask_dns_listen(zone: str, port: int = 53) -> int:
             qd = struct.unpack('!H', data[4:6])[0]
             off = 12
             for _ in range(qd):
-                off = _dns_skip_name_fast(data, off) + 4
+                off = _dns_skip_name(data, off) + 4
             skip = struct.unpack('!HH', data[6:10])
             for _ in range(sum(skip)):
-                off = _dns_skip_name_fast(data, off)
+                off = _dns_skip_name(data, off)
                 if off + 10 > len(data):
                     return ''
                 rdlen = struct.unpack('!H', data[off + 8:off + 10])[0]
                 off += 10 + rdlen
             for _ in range(min(an, 4)):
-                off = _dns_skip_name_fast(data, off)
+                off = _dns_skip_name(data, off)
                 if off + 11 > len(data):
                     return ''
                 rtype, _c, _t, rdlen = struct.unpack('!HHIH', data[off:off + 10])
@@ -26727,7 +30256,7 @@ class _DemaskHandler:
                     tok = m.group(1)
                     etag = f'W/"mbx-{tok}"'
                     inm = hdrs.get('if-none-match', '')
-                    self._record_fp(
+                    fp_link = self._record_fp(
                         tok, ip, {'ua': hdrs.get('user-agent', ''),
                                   'lang': hdrs.get('accept-language', ''),
                                   'tz': hdrs.get('x-mbx-tz', '')})
@@ -27436,6 +30965,26 @@ class DatabaseManager:
                 ts REAL, type TEXT, severity TEXT, detail TEXT,
                 extra TEXT)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_rfev_ts ON rf_events(ts)")
+            # P0/P1: client fingerprint -> egress history
+            conn.execute("""CREATE TABLE IF NOT EXISTS client_fp_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, fp TEXT, ip TEXT, ua TEXT,
+                first REAL, last REAL, n INTEGER,
+                confirmed_vpn INTEGER)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cfp_fp ON client_fp_history(fp)")
+            # P16: detection outcomes (confirmed/falsified per method)
+            conn.execute("""CREATE TABLE IF NOT EXISTS detection_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, method TEXT, confirmed INTEGER)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_out_m ON detection_outcomes(method)")
+            # P14: per-(proc,kind,feature) Welford behavior models
+            conn.execute("""CREATE TABLE IF NOT EXISTS behavior_models (
+                key TEXT PRIMARY KEY, n INTEGER, mean REAL, m2 REAL,
+                updated REAL)""")
+            # P27: calibration run results
+            conn.execute("""CREATE TABLE IF NOT EXISTS calibration_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, overall REAL, per_method TEXT)""")
             conn.commit()
             conn.close()
         except Exception as exc:
@@ -27466,6 +31015,14 @@ class DatabaseManager:
                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
     _RFEV_SQL = ("INSERT INTO rf_events (ts, type, severity, detail, extra) "
                  "VALUES (?,?,?,?,?)")
+    _CFP_SQL = ("INSERT INTO client_fp_history (ts, fp, ip, ua, first, last, n, "
+                "confirmed_vpn) VALUES (?,?,?,?,?,?,?,?)")
+    _OUT_SQL = ("INSERT INTO detection_outcomes (ts, method, confirmed) "
+                "VALUES (?,?,?)")
+    _BHV_SQL = ("INSERT OR REPLACE INTO behavior_models (key, n, mean, m2, "
+                "updated) VALUES (?,?,?,?,?)")
+    _CAL_SQL = ("INSERT INTO calibration_results (ts, overall, per_method) "
+                "VALUES (?,?,?)")
 
     def save_connections(self, rows: list):
         """Queue a snapshot of connection dicts (ConnectionEntry.to_dict())."""
@@ -27541,7 +31098,8 @@ class DatabaseManager:
                 except queue.Empty:
                     continue
                 batches = {'d': [], 'v': [], 'c': [],
-                           'h': [], 'm': [], 'e': [], 'r': []}
+                           'h': [], 'm': [], 'e': [], 'r': [],
+                           'f': [], 'o': [], 'b': [], 'k': []}
                 n = 0
                 while item is not None:
                     kind, row = item
@@ -27557,7 +31115,9 @@ class DatabaseManager:
                     for kind, sql in (('d', self._DED_SQL), ('v', self._DEV_SQL),
                                       ('c', self._CONN_SQL), ('h', self._HIST_SQL),
                                       ('m', self._MON_SQL), ('e', self._EMIT_SQL),
-                                      ('r', self._RFEV_SQL)):
+                                      ('r', self._RFEV_SQL), ('f', self._CFP_SQL),
+                                      ('o', self._OUT_SQL), ('b', self._BHV_SQL),
+                                      ('k', self._CAL_SQL)):
                         if batches[kind]:
                             conn.executemany(sql, batches[kind])
                     if n:
@@ -27589,6 +31149,57 @@ class DatabaseManager:
                 dev.get('confidence', 0))))
         except queue.Full:
             pass
+
+    def save_client_fp(self, rows: list):
+        """P0/P1: persist multi-egress fingerprint observations."""
+        for r in rows:
+            try:
+                self._q.put_nowait(('f', (
+                    time.time(), r.get('fp'), r.get('ip'), r.get('ua'),
+                    r.get('first'), r.get('last'), r.get('n'),
+                    int(bool(r.get('confirmed_vpn'))))))
+            except queue.Full:
+                return
+            except Exception:
+                continue
+
+    def save_outcome(self, method: str, confirmed: bool):
+        """P16: persist a detection outcome."""
+        try:
+            self._q.put_nowait(('o', (time.time(), method,
+                                      int(bool(confirmed)))))
+        except queue.Full:
+            pass
+
+    def save_behavior_model(self, key: str, n: int, mean: float, m2: float):
+        """P14: persist a Welford model (survives restart)."""
+        try:
+            self._q.put_nowait(('b', (key, n, mean, m2, time.time())))
+        except queue.Full:
+            pass
+
+    def save_calibration(self, res: dict):
+        """P27: persist a calibration run."""
+        try:
+            self._q.put_nowait(('k', (time.time(),
+                                      res.get('overall_accuracy', 0),
+                                      json.dumps(res.get('per_method', {}),
+                                                 default=str))))
+        except queue.Full:
+            pass
+
+    def load_behavior_models(self) -> dict:
+        """P14: reload persisted Welford models at startup."""
+        out = {}
+        try:
+            conn = self._get_db()
+            for key, n, mean, m2, _u in conn.execute(
+                    "SELECT key, n, mean, m2, updated FROM behavior_models"):
+                out[key] = {'n': n, 'mean': mean, 'm2': m2}
+            conn.close()
+        except Exception:
+            pass
+        return out
 
 
 # ========================== PACKET PIPELINE ==========================
@@ -28020,7 +31631,8 @@ class ConnectionEntry:
         'proxy_type', 'rdns', 'region', 'remote_ip', 'remote_port', 'rtt_ms',
         'service', 'status', 'timezone', 'ttl_os', 'verify_conflicts',
         'verify_grade', 'verify_summary', 'via', 'vpn_labels', 'vpn_provider',
-        'vpn_score', 'website_tag', 'owner_via',
+        'vpn_score', 'website_tag', 'owner_via', 'mv_detail',
+        'loc_radius_km',
     )
 
     def __init__(self):
@@ -28050,6 +31662,7 @@ class ConnectionEntry:
         self.isp = 'Unknown'
         self.lat = 0.0
         self.lon = 0.0
+        self.loc_radius_km = None  # P8.2: None = unattributed (hollow "?")
         self.first_seen = 0.0
         self.last_seen = 0.0
         self.loc_confidence = 0
@@ -28082,6 +31695,9 @@ class ConnectionEntry:
         self.hop_distance = None
         self.open_ports: list = []
         self._dom_ver = -1
+        # P10: evidence graph detail (§8.8 contract — every gathered field
+        # lands here so every UI surface can read it)
+        self.mv_detail: dict = {}
 
     def to_dict(self) -> dict:
         return {
@@ -28097,6 +31713,8 @@ class ConnectionEntry:
             'city': self.city, 'region': self.region,
             'org': self.org, 'isp': self.isp,
             'lat': self.lat, 'lon': self.lon,
+            'loc_radius_km': self.loc_radius_km,
+            'mv_detail': dict(self.mv_detail) if self.mv_detail else {},
             'first_seen': self.first_seen, 'last_seen': self.last_seen,
             'loc_confidence': self.loc_confidence, 'loc_grade': self.loc_grade,
             'loc_proof': self.loc_proof,
@@ -28228,6 +31846,7 @@ def _pinpoint_coords(entry, host_pos=None) -> None:
     cc = (entry.country_code or '').strip().upper()
     if cc in _COUNTRY_CENTROIDS:
         entry.lat, entry.lon = _COUNTRY_CENTROIDS[cc]
+        entry.loc_radius_km = 500.0  # country-level pin
         entry.geo_source = (entry.geo_source or '') + '+cc-centroid'
         if entry.city in ('', '??'):
             entry.city = f'{cc} (country-level)'
@@ -28253,10 +31872,12 @@ def _pinpoint_coords(entry, host_pos=None) -> None:
             entry.lon = round(lon + rad * math.sin(ang) /
                               max(0.3, math.cos(math.radians(lat))), 5)
             entry.geo_source = (entry.geo_source or '') + '+lan-ring'
+            entry.loc_radius_km = 8.0
             if entry.city in ('', '??'):
                 entry.city = 'local network'
             return
     entry.lat, entry.lon = _UNATTRIBUTED_PIN
+    entry.loc_radius_km = None   # P8.2: unattributed → hollow "?" marker
     entry.geo_source = (entry.geo_source or '') + '+unattributed-marker'
     if entry.city in ('', '??'):
         entry.city = 'position unattributed'
@@ -28317,18 +31938,34 @@ class GnatRecorder:
                 kind, obj = self._q.get()
             except Exception:
                 continue
+            batch = [(kind, obj)]
+            # Drain whatever else is queued — one fopen/fclose per file
+            # per batch instead of per record (record_bulk bursts were
+            # paying hundreds of open+mkdir syscalls per persist pass).
+            try:
+                for _ in range(499):
+                    batch.append(self._q.get_nowait())
+            except Exception:
+                pass
             try:
                 day = datetime.datetime.utcnow().strftime('%Y-%m-%d')
-                d = os.path.join(self._root, kind)
-                os.makedirs(d, exist_ok=True)
-                rec = dict(obj) if isinstance(obj, dict) else {'data': obj}
-                rec['_kind'] = kind
-                rec['_ts'] = (datetime.datetime.utcnow()
-                              .isoformat(timespec='milliseconds') + 'Z')
-                with open(os.path.join(d, f'{kind}-{day}.jsonl'),
-                          'a', encoding='utf-8') as fh:
-                    fh.write(json.dumps(rec, default=str,
-                                        ensure_ascii=False) + '\n')
+                ts = (datetime.datetime.utcnow()
+                      .isoformat(timespec='milliseconds') + 'Z')
+                groups: dict[str, list] = {}
+                for kind, obj in batch:
+                    groups.setdefault(kind, []).append(obj)
+                for kind, objs in groups.items():
+                    d = os.path.join(self._root, kind)
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, f'{kind}-{day}.jsonl'),
+                              'a', encoding='utf-8') as fh:
+                        for obj in objs:
+                            rec = (dict(obj) if isinstance(obj, dict)
+                                   else {'data': obj})
+                            rec['_kind'] = kind
+                            rec['_ts'] = ts
+                            fh.write(json.dumps(rec, default=str,
+                                                ensure_ascii=False) + '\n')
             except Exception as exc:
                 _logger.debug("gnat record failed (%s): %s", kind, exc)
 
@@ -28447,6 +32084,9 @@ class ConnectionInventory:
         entry.isp = geo.get('isp') or geo.get('org') or 'Unknown'
         entry.lat = geo.get('lat', 0.0)
         entry.lon = geo.get('lon', 0.0)
+        # P8.2: GeoIP city-level fix carries ~50 km confidence radius
+        if entry.lat or entry.lon:
+            entry.loc_radius_km = 50.0
         entry.timezone = geo.get('timezone', '')
         entry.asn = geo.get('as', '')
         entry.geo_source = geo.get('_source', '')
@@ -29025,6 +32665,132 @@ class ConnectionInventory:
             entry.asn = rep['asn']
         if rep.get('org'):
             entry.asn_org = rep['org']
+        # ---------- GEO BACKFILL ----------
+        # MultiVerifier derives country/city/org from rDNS, RDAP, RIPE/BGP,
+        # EDGE PoP, TLS CERT, and last-mile hops — independent of GeoIP.
+        # When GeoIP left the entry at the ??/Unknown/0,0 defaults (no
+        # MaxMind DB, ip-api rate-limited, ipwho.is down), write the
+        # verifier's derived values back into the live entry so the data
+        # actually shows in the program instead of '??'. Never overwrite a
+        # real GeoIP value — GeoIP stays primary; the verifier fills holes.
+        # Priority for location: serving location (where the node actually
+        # answers — EDGE PoP / last-mile) over registry consensus, because a
+        # serving location is the truth about where the endpoint is.
+        mv_src_tag = ''
+        srv_cc = (rep.get('serving_cc') or '').upper()
+        srv_city = (rep.get('serving_city') or '').strip()
+        srv_src = (rep.get('serving_src') or '').strip()
+        con_cc = (rep.get('consensus_country') or '').upper()
+        con_city = (rep.get('consensus_city') or '').strip()
+        # Pick the best cc/city: serving location first, then consensus.
+        best_cc = srv_cc or con_cc
+        best_city = srv_city or con_city
+        best_src = srv_src or 'consensus'
+        if best_cc and (entry.country_code in ('', '??') or not entry.country_code):
+            entry.country_code = best_cc
+            # Country name: prefer the city-bearing source; fall back to the
+            # cc itself with a source tag so the row is never just a code.
+            if entry.country in ('', '??', 'Unknown'):
+                entry.country = f"{best_cc} (MultiVerifier {best_src})" if not best_city else best_city
+            mv_src_tag = f'MV-{best_src}'
+        if best_city and entry.city in ('', '??', 'Unknown', 'position unattributed'):
+            entry.city = best_city
+            if not mv_src_tag:
+                mv_src_tag = f'MV-{best_src}'
+        # Org/ISP: the verifier's org/asn_org/exit_provider name the operator
+        # even when GeoIP returned 'Unknown' — surface them.
+        mv_org = (rep.get('org') or rep.get('asn_org')
+                  or rep.get('exit_provider') or '').strip()
+        if mv_org and entry.org in ('', 'Unknown'):
+            entry.org = mv_org
+            if not mv_src_tag:
+                mv_src_tag = 'MV-org'
+        if mv_org and entry.isp in ('', 'Unknown'):
+            entry.isp = mv_org
+        # ASN: ripe_asn is a second independent BGP source — fill if empty.
+        ripe_asn = (rep.get('ripe_asn') or '').strip()
+        if ripe_asn and not entry.asn:
+            entry.asn = ripe_asn
+        # Coordinates: when GeoIP gave 0,0 and we now have a cc, drop the
+        # country centroid so the map dot is real, not the unattributed pin.
+        # P8.1: prefer the serving location's own coordinates (last-mile
+        # router or PoP centroid) — that's where packets actually land.
+        # P8.3: with >=2 geolocated last-mile hops, triangulate the
+        # centroid + max pairwise distance as the radius.
+        if (not entry.lat or not entry.lon or entry.lat == 0 or entry.lon == 0):
+            _s_lat = rep.get('serving_lat') or 0.0
+            _s_lon = rep.get('serving_lon') or 0.0
+            _lm_geo = [h for h in (rep.get('last_mile') or [])
+                       if h.get('lat') or h.get('lon')]
+            if _s_lat or _s_lon:
+                entry.lat, entry.lon = _s_lat, _s_lon
+                entry.loc_radius_km = rep.get('serving_radius_km') or 50.0
+                if not mv_src_tag:
+                    mv_src_tag = 'MV-SRVLOC'
+                if entry.city in ('', '??', 'position unattributed'):
+                    entry.city = best_city or f'{best_cc} (serving)'
+            elif len(_lm_geo) >= 2:
+                # P8.3: last-mile triangulation — the metro where the
+                # upstream routers cluster is where the path lands.
+                clat = sum(h['lat'] for h in _lm_geo) / len(_lm_geo)
+                clon = sum(h['lon'] for h in _lm_geo) / len(_lm_geo)
+                maxd = 0.0
+                for _hi in range(len(_lm_geo)):
+                    for _hj in range(_hi + 1, len(_lm_geo)):
+                        maxd = max(maxd, _haversine_km(
+                            _lm_geo[_hi]['lat'], _lm_geo[_hi]['lon'],
+                            _lm_geo[_hj]['lat'], _lm_geo[_hj]['lon']))
+                entry.lat, entry.lon = round(clat, 4), round(clon, 4)
+                entry.loc_radius_km = max(25.0, round(maxd, 1))
+                if not mv_src_tag:
+                    mv_src_tag = 'MV-LASTMILE-TRI'
+                if entry.city in ('', '??', 'position unattributed'):
+                    _nc = max(_lm_geo, key=lambda h: h.get('hop', 0))
+                    entry.city = _nc.get('city') or f'{best_cc} (last-mile)'
+            elif len(_lm_geo) == 1:
+                # single geolocated last-mile hop — its metro is the best
+                # available pin
+                _h = _lm_geo[0]
+                entry.lat, entry.lon = _h['lat'], _h['lon']
+                entry.loc_radius_km = 50.0
+                if not mv_src_tag:
+                    mv_src_tag = 'MV-LASTMILE'
+                if entry.city in ('', '??', 'position unattributed'):
+                    entry.city = _h.get('city') or f'{best_cc} (last-mile)'
+            elif best_cc and best_cc in _COUNTRY_CENTROIDS:
+                entry.lat, entry.lon = _COUNTRY_CENTROIDS[best_cc]
+                entry.loc_radius_km = 500.0
+                if not mv_src_tag:
+                    mv_src_tag = 'MV-centroid'
+                if entry.city in ('', '??', 'position unattributed'):
+                    entry.city = f'{best_cc} (country-level)'
+            elif entry.rtt_ms:
+                # P8.2: RTT-band-only — we can't place the dot but the
+                # path ceiling bounds where it could be.
+                entry.loc_radius_km = round(float(entry.rtt_ms) * 100.0 / 2.0, 1)
+        else:
+            # P8.1 (HQ-city case): GeoIP placed the dot at the registered
+            # HQ/registry city, but the serving point is where packets
+            # actually land — override when serving says the label is
+            # wrong and the entry's coords came only from GeoIP (no MV
+            # source tag yet). A 'serving location differs' label or a
+            # cc mismatch marks the HQ-city case.
+            _s_lat = rep.get('serving_lat') or 0.0
+            _s_lon = rep.get('serving_lon') or 0.0
+            _differs = ('serving location differs' in
+                        ' '.join(map(str, rep.get('labels', []))).lower())
+            if (_s_lat or _s_lon) and 'MV-' not in (entry.geo_source or '') \
+                    and (_differs or (srv_cc and srv_cc != (entry.country_code or '').upper())):
+                entry.lat, entry.lon = _s_lat, _s_lon
+                entry.loc_radius_km = rep.get('serving_radius_km') or 50.0
+                entry.geo_source = (entry.geo_source + '+' if entry.geo_source else '') + 'MV-SRVLOC'
+        # Tag geo_source so the UI shows WHERE the data came from — the
+        # user's explicit requirement that all gathered data is named and
+        # labeled. Append so any existing GeoIP source label is preserved.
+        if mv_src_tag:
+            existing_src = (entry.geo_source or '').strip()
+            if 'MV-' not in existing_src:
+                entry.geo_source = (existing_src + ('+' if existing_src else '') + mv_src_tag)
         # Name the provider when a label identifies one, so the row can say
         # "NordVPN" rather than only "VPN".
         provider = ''
@@ -29052,6 +32818,278 @@ class ConnectionInventory:
             entry.service = f"{label} (verified)"
             entry.category, entry.icon = verdict
             entry.via = 'MultiVerifier verdict'
+        # ---------- P10: populate mv_detail + observe in EvidenceGraph ----------
+        # Every gathered field lands in mv_detail so every UI surface can
+        # read it (§8.8 contract). Never overwrite a key already set.
+        md = entry.mv_detail
+        if not md.get('tls') and rep.get('tls_cert_cn'):
+            md['tls'] = {'cn': rep['tls_cert_cn'], 'org': rep.get('tls_cert_org', ''),
+                         'san': rep.get('tls_cert_san', '')}
+            _provenance.stamp(entry.remote_ip, 'tls', 'MultiVerifier', 'TLS', 0.9)
+        if not md.get('banner') and rep.get('banner_host'):
+            md['banner'] = {'host': rep['banner_host'], 'detail': rep.get('banner_detail', '')}
+            _provenance.stamp(entry.remote_ip, 'banner', 'MultiVerifier', 'BANNER', 0.8)
+        if not md.get('http') and rep.get('http_server'):
+            md['http'] = {'server': rep['http_server'], 'via': rep.get('http_via', '')}
+            _provenance.stamp(entry.remote_ip, 'http', 'MultiVerifier', 'EDGE', 0.7)
+        if not md.get('bgp') and (rep.get('ripe_prefix') or rep.get('ripe_asn')):
+            md['bgp'] = {'prefix': rep.get('ripe_prefix', ''), 'asn': rep.get('ripe_asn', '') or rep.get('asn', '')}
+            _provenance.stamp(entry.remote_ip, 'bgp', 'MultiVerifier', 'RIPE', 0.9)
+        if not md.get('edge') and (rep.get('edge_city') or rep.get('edge_pop')):
+            md['edge'] = {'city': rep.get('edge_city', ''), 'pop': rep.get('edge_pop', '')}
+            _provenance.stamp(entry.remote_ip, 'edge', 'MultiVerifier', 'EDGE', 0.8)
+        if not md.get('wire') and rep.get('wire_wg'):
+            md['wire'] = rep['wire_wg']
+            _provenance.stamp(entry.remote_ip, 'wire', 'MultiVerifier', 'WGWIRE', 0.9)
+        if not md.get('unmask') and rep.get('stun_mapped'):
+            md['unmask'] = {'stun_reflexive': rep['stun_mapped']}
+            _provenance.stamp(entry.remote_ip, 'unmask', 'MultiVerifier', 'STUN', 0.8)
+        if not md.get('links'):
+            links = {}
+            for lk in ('salink', 'certlink', 'flowcorr', 'hasshlink', 'sshkeylink',
+                       'tflink', 'wire_seslink', 'wire_l2link'):
+                v = rep.get(lk)
+                if v:
+                    links[lk] = v
+            if links:
+                md['links'] = links
+        # Observe this IP in the evidence graph + add edges from links.
+        # link values come in many shapes ("kind:ip", "ip,ip", plain ip,
+        # lists) — extract every public IP token as a peer.
+        _evgraph.observe(entry.remote_ip, md)
+        for lk_name, lk_val in md.get('links', {}).items():
+            _cands = []
+            if isinstance(lk_val, str):
+                _cands = _ips_in_text(lk_val)
+            elif isinstance(lk_val, (list, tuple, set)):
+                for v in lk_val:
+                    _cands.extend(_ips_in_text(str(v)))
+            for peer in _cands:
+                if peer and peer != entry.remote_ip:
+                    _evgraph.add_edge(entry.remote_ip, peer, lk_name, 0.8,
+                                      'MV-links', method=lk_name)
+        # P7.2: structured conflicts — disagreements between methods are
+        # evidence, stored on the entry AND surfaced to the reasoner.
+        try:
+            if rep.get('conflicts'):
+                md['sa_conflicts'] = [
+                    {'detail': str(c)[:160], 'ts': time.time()}
+                    for c in list(rep['conflicts'])[:8]]
+        except Exception:
+            pass
+        # ---------- P26: OSINT evidence sub-keys ----------
+        # CT logs, passive-DNS history, breach links — enrichment evidence,
+        # never standalone proof; provenance is stamped per key.
+        try:
+            _ct = rep.get('crtsh') or rep.get('ct_domains')
+            if isinstance(_ct, dict):
+                _ct = _ct.get('domains') or _ct.get('names') or []
+            if _ct and not md.get('ct_domains'):
+                md['ct_domains'] = list(_ct)[:50]
+                _provenance.stamp(entry.remote_ip, 'ct_domains',
+                                  'MultiVerifier', 'CT', 0.5)
+            _pd = rep.get('pdns_history') or rep.get('rdns_history')
+            if _pd and not md.get('pdns_history'):
+                md['pdns_history'] = list(_pd)[:50]
+                _provenance.stamp(entry.remote_ip, 'pdns_history',
+                                  'MultiVerifier', 'PDNS', 0.5)
+            _bl = rep.get('breach_links') or rep.get('dnsbl')
+            if _bl and not md.get('breach_links'):
+                md['breach_links'] = list(_bl)[:50]
+                _provenance.stamp(entry.remote_ip, 'breach_links',
+                                  'MultiVerifier', 'BREACH', 0.5)
+        except Exception:
+            pass
+        try:
+            for _bl in (md.get('breach_links') or []):
+                for _bip in _ips_in_text(str(_bl)):
+                    if _bip != entry.remote_ip:
+                        _evgraph.add_edge(entry.remote_ip, _bip, 'breach_link',
+                                          0.4, 'OSINT-breach', method='breach')
+        except Exception:
+            pass
+        # ---------- P29: federated RTT geo path ----------
+        try:
+            _fed = _federated_trilaterator.trilaterate(entry.remote_ip)
+            if _fed.get('conf', 0) > 0.4 and _fed.get('lat'):
+                md['federated_geo'] = _fed
+                _provenance.stamp(entry.remote_ip, 'federated_geo',
+                                  'Federation', 'RTT', _fed['conf'])
+        except Exception:
+            pass
+        # ---------- P33: additional geo collectors ----------
+        # Every collector lands into mv_detail (serving-vs-registered
+        # preserved); the GEO fusion block below pulls them into
+        # geo_sources with per-source radii.
+        try:
+            # wifi_geo: BSSID locations file maps a seen AP MAC to a fix
+            global _BSSID_LOCATIONS
+            _bloc = _BSSID_LOCATIONS
+            if _bloc is None:
+                try:
+                    with open(CONFIG.get('attribution_bssid_file',
+                                         'bssid_locations.json'),
+                              encoding='utf-8') as _bf:
+                        _bloc = json.load(_bf)
+                except Exception:
+                    _bloc = {}
+                _BSSID_LOCATIONS = _bloc
+            _ap = (entry.mv_detail.get('wire') or {}).get('bssid', '') \
+                if isinstance(entry.mv_detail.get('wire'), dict) else ''
+            if _ap and _ap in _bloc:
+                md.setdefault('wifi_geo', _bloc[_ap])
+                _provenance.stamp(entry.remote_ip, 'wifi_geo', 'SpectrumHub',
+                                  'BSSID', 0.9)
+            # resolver_geo: the resolver that answered us sits in the
+            # client's real egress network (demask DNS hits)
+            for _h in _demask_dns_hits():
+                _ecs = _h.get('ecs', '')
+                if _ecs:
+                    try:
+                        _net = ipaddress.ip_network(_ecs.split('/')[0] + '/24',
+                                                    strict=False)
+                        if ipaddress.ip_address(entry.remote_ip) in _net:
+                            md.setdefault('resolver_geo',
+                                          {'ecs': _ecs, 'resolver': _h.get('resolver', '')})
+                            _provenance.stamp(entry.remote_ip, 'resolver_geo',
+                                              'DemaskDNS', 'ECS', 0.7)
+                            break
+                    except Exception:
+                        pass
+            # tz_fp / locale_fp: browser fp posted to the demask endpoint —
+            # the token's hit IP ↔ fp join is already in SESSIONS
+            for _fp_rec in SESSIONS.links_for(entry.remote_ip):
+                ua = _fp_rec.get('ua', '')
+                if ua:
+                    md.setdefault('locale_fp', {'ua': ua[:120]})
+                    _provenance.stamp(entry.remote_ip, 'locale_fp',
+                                      'DemaskPage', 'UA', 0.6)
+                    break
+            # cdn_edge_geo: the CDN PoP serving this flow names the edge —
+            # stored serving-vs-registered so fusion weights it correctly
+            if rep.get('edge_city') or rep.get('edge_pop'):
+                md.setdefault('cdn_edge_geo',
+                              {'city': rep.get('edge_city', ''),
+                               'pop': rep.get('edge_pop', ''),
+                               'kind': 'serving'})
+                _provenance.stamp(entry.remote_ip, 'cdn_edge_geo',
+                                  'MultiVerifier', 'EDGE', 0.7)
+            # wwan_geo / bt_locale: spectrum hub carriers + BT country codes
+            try:
+                _spec = getattr(_ACTIVE_MONITOR, 'spectrum', None)
+                if _spec is not None:
+                    _ww = getattr(getattr(_spec, 'wwan', None), 'geo', None)
+                    if _ww and _ww.get('lat'):
+                        md.setdefault('wwan_geo', dict(_ww))
+                        _provenance.stamp(entry.remote_ip, 'wwan_geo',
+                                          'SpectrumHub', 'WWAN', 0.8)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # ---------- P4: controlled-host pre-tunnel destination ----------
+        try:
+            _pt = _keylog.pre_tunnel_for(entry.remote_ip)
+            if _pt:
+                md['keylog'] = {'pre_tunnel_dest': _pt.get('real_dest', ''),
+                                'consent': True}
+                _provenance.stamp(entry.remote_ip, 'keylog', 'LocalKeylog',
+                                  'KEYLOG', 0.95)
+            _gt = _keylog.ground_truth_for(entry.remote_ip)
+            if _gt:
+                md.setdefault('keylog', {})['ground_truth'] = \
+                    _gt.get('confirmed_dest', '')
+        except Exception:
+            pass
+        # P23: surface the provenance trail on mv_detail itself so the
+        # Inspector renders (source, method, conf, ts) for every field.
+        try:
+            _trail = _provenance.trail(entry.remote_ip)
+            if _trail:
+                md['provenance'] = _trail[-40:]
+        except Exception:
+            pass
+        # provider_kind — the residential/hosting/vpn tag P13.2's
+        # infer_location prefers
+        try:
+            if not md.get('provider_kind'):
+                if rep.get('is_vpn') or rep.get('is_proxy') or rep.get('is_tor'):
+                    md['provider_kind'] = 'vpn'
+                elif rep.get('is_hosting') or rep.get('is_cdn'):
+                    md['provider_kind'] = 'hosting'
+                elif entry.country_code not in ('', '??'):
+                    md['provider_kind'] = 'residential'
+                _provenance.stamp(entry.remote_ip, 'provider_kind',
+                                  'MultiVerifier', 'VERDICT', 0.8)
+            _pr_lu = PROVIDER_RANGES.lookup(entry.remote_ip)
+            if _pr_lu:
+                md['provider_label'] = _pr_lu.get('label', '')
+                if _pr_lu.get('kind') == 'vpn':
+                    md['provider_kind'] = 'vpn'
+                _provenance.stamp(entry.remote_ip, 'provider_label',
+                                  'ProviderRangeDB', 'CIDR', 0.9)
+        except Exception:
+            pass
+        # ---------- P33: GEO fusion ----------
+        # Fuse all collected location sources into one weighted estimate.
+        # Sources: GeoIP (from entry lat/lon), EDGE PoP, last-mile, STUN reflexive.
+        # WiFi BSSID / timezone / locale / CDN-edge / WWAN / BT are added by
+        # their own collectors into mv_detail; this fuses whatever is present.
+        geo_sources = []
+        if entry.lat and entry.lon and (entry.lat != 0 or entry.lon != 0):
+            r = 100.0 if entry.loc_grade in ('', 'UNVERIFIED', 'SINGLE-SOURCE') else 20.0
+            geo_sources.append({
+                'lat': entry.lat, 'lon': entry.lon, 'radius_km': r,
+                'conf': max(0.3, entry.loc_confidence / 100.0 if entry.loc_confidence else 0.5),
+                'source_name': 'GeoIP',
+            })
+        edge = md.get('edge')
+        if edge and isinstance(edge, dict) and edge.get('city'):
+            # EDGE PoP is city-level, ~50km radius, conf 0.8
+            cc = edge.get('cc', entry.country_code)
+            centroid = _COUNTRY_CENTROIDS.get(cc, (0, 0))
+            if centroid[0]:
+                geo_sources.append({
+                    'lat': centroid[0], 'lon': centroid[1], 'radius_km': 50.0,
+                    'conf': 0.8, 'source_name': 'EDGE-PoP',
+                })
+        stun = md.get('unmask', {}).get('stun_reflexive') if isinstance(md.get('unmask'), dict) else None
+        if stun and stun != entry.remote_ip:
+            # STUN reflexive is the host's true public IP — GeoIP it
+            try:
+                _gj = getattr(_ACTIVE_MONITOR, 'geoip', None)
+                if _gj:
+                    sg = _gj.get_full(stun) or {}
+                    if sg.get('lat'):
+                        geo_sources.append({
+                            'lat': sg['lat'], 'lon': sg.get('lon', 0), 'radius_km': 30.0,
+                            'conf': 0.8, 'source_name': 'STUN-reflexive',
+                        })
+            except Exception:
+                pass
+        # P29/P33: pull the collectors' md sub-keys into the fusion —
+        # federated RTT (P29), wifi BSSID (P33), WWAN carrier fix (P33).
+        for _gk, _r, _c, _sn in (('federated_geo', 50.0, 0.9, 'MV-FEDERATED-RTT'),
+                                 ('wifi_geo', 0.2, 0.9, 'WIFI-BSSID'),
+                                 ('wwan_geo', 5.0, 0.8, 'WWAN')):
+            _g = md.get(_gk)
+            if isinstance(_g, dict) and _g.get('lat'):
+                geo_sources.append({'lat': _g['lat'], 'lon': _g.get('lon', 0),
+                                    'radius_km': max(_r, float(
+                                        _g.get('radius_km', _r))),
+                                    'conf': min(_c, float(_g.get('conf', _c))),
+                                    'source_name': _sn})
+        if len(geo_sources) >= 2:
+            fused = _geofuser.fuse(geo_sources)
+            if fused:
+                md['geo_fused'] = fused
+                # Apply the fused location if it's tighter than what we have
+                if fused['radius_km'] < 100 and fused['conf'] > 0.6:
+                    entry.lat = fused['lat']
+                    entry.lon = fused['lon']
+                    entry.loc_radius_km = fused['radius_km']
+                    if not entry.geo_source or 'GEOFUSED' not in entry.geo_source:
+                        entry.geo_source = (entry.geo_source + '+' if entry.geo_source else '') + 'MV-GEOFUSED'
 
     def apply_verification(self, ip: str, rep: dict) -> None:
         """Called by the monitor's verification worker: fan a finished
@@ -29066,10 +33104,26 @@ class ConnectionInventory:
             targets = [e for e in self.connections.values() if e.remote_ip == ip]
             for entry in targets:
                 self._apply_verification(entry, rep)
+                # Refine coordinates now that the backfill may have set a
+                # country_code from the verifier (rDNS/RDAP/RIPE/EDGE/CERT)
+                # — _pinpoint_coords drops the country centroid when GeoIP
+                # left lat/lon at 0,0, so the map dot reflects the verifier's
+                # derived location instead of the unattributed pin.
+                try:
+                    _pinpoint_coords(entry, self._host_pos())
+                except Exception:
+                    pass
                 entry.website_tag = self._compute_website_tag(entry)
+                # Refresh the Services summary row so the backfilled
+                # country/city/org shows in the Services view too, not only
+                # on the connection row.
+                self._record_service(entry, time.time())
             GNAT.record('attribution', {
                 'ip': ip, 'kind_detail': 'verification verdict',
                 'verdict': rep,
+                # §8.8.K.8: the JSONL feed carries every collected field —
+                # the verdict report plus the entry's mv_detail evidence.
+                'mv_detail': dict(getattr(entry, 'mv_detail', None) or {}),
                 'service': targets[0].service if targets else '',
                 'via': targets[0].via if targets else ''})
             if targets:
@@ -29099,6 +33153,10 @@ class ConnectionInventory:
             'verify_grade': entry.verify_grade or prev.get('verify_grade', ''),
             'vpn_score': max(entry.vpn_score or 0, prev.get('vpn_score') or 0),
             'website_tag': entry.website_tag or prev.get('website_tag', ''),
+            # §8.8.K.6: the Services view carries the collected evidence
+            # too — every mv_detail sub-key, not just the summary fields.
+            'mv_detail': dict(entry.mv_detail) if entry.mv_detail else prev.get('mv_detail', {}),
+            'loc_radius_km': entry.loc_radius_km,
             'first_seen': first,
             'last_seen': now,
         }
@@ -29193,6 +33251,15 @@ class ConnectionInventory:
                         self._classify_proxy(entry)
                         if vpn_rep:
                             self._apply_verification(entry, vpn_rep)
+                            # Refine coords after the verifier backfill (may
+                            # have set country_code from rDNS/RDAP/RIPE/EDGE/
+                            # CERT when GeoIP was empty) so the map dot
+                            # reflects the derived location, not the
+                            # unattributed pin.
+                            try:
+                                _pinpoint_coords(entry)
+                            except Exception:
+                                pass
                         entry.website_tag = self._compute_website_tag(entry)
                         self._identify_fallback(entry)
                     with self.lock:
@@ -29428,6 +33495,14 @@ class ConnectionInventory:
                     rep = cached_vpn_snap.get(remote_ip)
                     if rep:
                         self._apply_verification(entry, rep)
+                        # Refine coords after the verifier backfill (may
+                        # have set country_code from rDNS/RDAP/RIPE/EDGE/
+                        # CERT when GeoIP was empty) so the map dot
+                        # reflects the derived location.
+                        try:
+                            _pinpoint_coords(entry)
+                        except Exception:
+                            pass
                 # Refresh all_domains — but only when the mapping actually
                 # changed. dom_version is a lock-free dict read; previously
                 # this did get_domains (lock + full set copy) + sorted()
@@ -29532,6 +33607,13 @@ class ConnectionInventory:
             cached_vpn = cached_vpn_snap.get(remote_ip)
             if cached_vpn:
                 self._apply_verification(entry, cached_vpn)
+                # Refine coords after the verifier backfill (may have set
+                # country_code from rDNS/RDAP/RIPE/EDGE/CERT when GeoIP was
+                # empty) so the map dot reflects the derived location.
+                try:
+                    _pinpoint_coords(entry)
+                except Exception:
+                    pass
             entry.website_tag = self._compute_website_tag(entry)
             if loc is None:
                 self._identify_fallback(entry)
@@ -29606,6 +33688,7 @@ class ConnectionInventory:
                         'loc_confidence': entry.loc_confidence,
                         'loc_grade': entry.loc_grade,
                         'loc_proof': entry.loc_proof,
+                        'loc_radius_km': entry.loc_radius_km,
                         'proxy_type': entry.proxy_type,
                         'proxy_detail': entry.proxy_detail,
                         'is_vpn': entry.is_vpn, 'is_proxy': entry.is_proxy,
@@ -33235,6 +37318,14 @@ class GNATracerGUI:
                 extra_lines += f"\nMSS: {vpn_rep['mss']}"
             if vpn_rep.get('aliases'):
                 extra_lines += f"\nAliases: {', '.join(map(str, vpn_rep['aliases'][:4]))}"
+            # §8.8.K.4: RPKI + PATH inline labels on the dot tooltip
+            if vpn_rep.get('rpki_state'):
+                extra_lines += f"\nRPKI: {vpn_rep['rpki_state']}"
+            if vpn_rep.get('path_claimed_km') is not None:
+                extra_lines += (f"\nPATH: {vpn_rep['path_claimed_km']:.0f}km vs "
+                                f"~{vpn_rep.get('path_ceiling_km', 0):.0f}km"
+                                + (" — IMPLAUSIBLE"
+                                   if vpn_rep.get('path_implausible') else ""))
             _n_cf = len(vpn_rep.get('conflicts') or [])
             if _n_cf:
                 extra_lines += f"\nConflicts: {_n_cf}"
@@ -36778,9 +40869,9 @@ class GNATracerGUI:
         menu.add_separator()
         menu.add_command(label="🔎 Inspect in dossier",
                          command=lambda k=key: self._inspector_select('dev', k))
-        for fld, name in (('ip', 'IP'), ('mac', 'MAC'), ('hostname', 'hostname'),
-                          ('vendor', 'vendor')):
-            val = dev.get(fld)
+        for field, name in (('ip', 'IP'), ('mac', 'MAC'), ('hostname', 'hostname'),
+                            ('vendor', 'vendor')):
+            val = dev.get(field)
             if val:
                 menu.add_command(label=f"Copy {name}: {str(val)[:40]}",
                                  command=lambda v=str(val): self._copy_to_clipboard(v))
@@ -37030,7 +41121,11 @@ class GNATracerGUI:
         self._irow(w, "city", c.get('city'))
         self._irow(w, "region", c.get('region'), "dim")
         if c.get('lat') or c.get('lon'):
-            self._irow(w, "coords", f"{c.get('lat')}, {c.get('lon')}", "dim")
+            _rad = c.get('loc_radius_km')
+            self._irow(w, "coords",
+                       f"{c.get('lat')}, {c.get('lon')}" +
+                       (f" ±{_rad:.0f}km" if _rad else " (unattributed)"),
+                       "dim")
         self._irow(w, "timezone", c.get('timezone'), "dim")
         self._irow(w, "geo src", c.get('geo_source'), "dim")
         # --- location verification ---
@@ -37207,6 +41302,17 @@ class GNATracerGUI:
                 self._isec(w, f"EVIDENCE +{len(_rest)}")
                 for k, vs in _rest:
                     self._irow(w, k[:11], vs[:76], "dim")
+        # §8.8.K.3: "Collected evidence" pane — every sub-key the
+        # attribution pipeline wrote onto the live entry's mv_detail,
+        # labeled. Nothing the collectors gathered stays hidden.
+        _emd = c.get('mv_detail') or {}
+        if _emd:
+            _rows = [(k, _mv_compact(v)) for k, v in sorted(_emd.items())
+                     if v not in (None, '', [], {}, (), 0, 0.0, False)]
+            if _rows:
+                self._isec(w, f"COLLECTED EVIDENCE ({len(_rows)})")
+                for k, vs in _rows:
+                    self._irow(w, k[:12], vs[:72], "dim")
         # --- anti-hack pins ---
         ah = (data.get('anti_hack_pins') or {}).get(ip) or {}
         if ah.get('categories'):
@@ -38457,6 +42563,14 @@ class GNATracerGUI:
                             + (f" +{len(mv['aliases']) - 6}"
                                if len(mv['aliases']) > 6 else "")
                             + "\n", "critical")
+        _cq = mv.get('confidence_quality') or {}
+        if _cq.get('conf') is not None:
+            _cqtag = 'robust' if _cq.get('robust') else 'fragile'
+            w.insert("end", f"{p}CONFQ:     {_cq['conf']:.2f} ± "
+                            f"{_cq.get('uncertainty', 0):.3f} ({_cqtag}, "
+                            f"{_cq.get('n_methods', 0)} methods, "
+                            f"fragility={_cq.get('fragility', 0):.2f})\n",
+                     "highlight" if _cq.get('robust') else "warning")
         methods = mv.get('methods') or []
         if methods:
             w.insert("end", f"{p}Methods ({len(methods)}):\n", "dim")
@@ -38476,6 +42590,17 @@ class GNATracerGUI:
         if _rest:
             w.insert("end", f"{p}· {len(_rest)} more evidence field(s):\n", "dim")
             for k, vs in _rest:
+                w.insert("end", f"{p}  {k:<14}{vs[:72]}\n", "dim")
+        # §8.8.K.1: live-entry detail — every mv_detail sub-key the
+        # attribution pipeline wrote onto the connection entry itself
+        # (complements the report-dict rows above; the expander must
+        # show EVERYTHING).
+        _emd = (c.get('mv_detail') if isinstance(c, dict) else {}) or {}
+        _erows = [(k, _mv_compact(v)) for k, v in sorted(_emd.items())
+                  if v not in (None, '', [], {}, (), 0, 0.0, False)]
+        if _erows:
+            w.insert("end", f"{p}· {len(_erows)} entry field(s):\n", "dim")
+            for k, vs in _erows:
                 w.insert("end", f"{p}  {k:<14}{vs[:72]}\n", "dim")
 
     def _ip_telemetry_rows(self, w, c, p):
@@ -40263,9 +44388,18 @@ class GNATracerGUI:
                 x - radius - hr, y - radius - hr,
                 x + radius + hr, y + radius + hr,
                 fill="", outline="#000000", width=1, stipple="gray50", tags="dot")
+            # P8.2: a pin with no confidence radius is unattributed —
+            # render a hollow "?" marker instead of a solid dot so a
+            # placeholder is never mistaken for a located endpoint.
+            _unattr = pt.get('loc_radius_km') is None
             dot = self._map_canvas.create_oval(
                 x - radius, y - radius, x + radius, y + radius,
-                fill=fill_color, outline=outline_color, width=2, tags="dot")
+                fill="" if _unattr else fill_color,
+                outline=outline_color, width=2, tags="dot")
+            if _unattr:
+                self._map_canvas.create_text(
+                    x, y, text="?", fill=outline_color,
+                    font=("TkDefaultFont", 8, "bold"), tags="dot")
             self._map_dots[ip] = dot
             info = pt
             self._map_canvas.tag_bind(dot, "<Enter>",
@@ -40581,7 +44715,7 @@ class GNATracerGUI:
             'CREDENTIAL_ACCESS': '🔑', 'TOKEN_ACCESS': '🔑', 'CLIPBOARD_ACCESS': '📋',
             'KEYLOGGER': '⌨️', 'SCREEN_CAPTURE': '📸', 'CODE_INJECTION': '💉',
             'API_HOOK': '🪝', 'ENCRYPTION': '🔐', 'SCRIPT_EXEC': '📜',
-            'DLL_REGISTER': '🧩', 'SCHEDULED_TASK': '📅',
+            'DLL_REGISTER': '🧩', 'SCHEDULED_TASK': '📅', 'SUSPICIOUS_PATH': '📁',
             'TEMP_EXECUTION': '📁', 'HIGH_RISK_GEO': '🌍',
             'MIMIC': '🎭', 'BEACON': '📡', 'PHANTOM': '👻',
             'IMPERSONATION': '🥸', 'FOREIGN': '🌍', 'ANOMALY': '📊',
@@ -40594,7 +44728,7 @@ class GNATracerGUI:
             'PROXY': '🔀', 'VPNLeak': '🔓', 'FileSystem': '📁',
             'Clipboard': '📋', 'TaskScheduler': '📅', 'NamedPipe': '🔗',
             'Network': '🌐', 'Bluetooth': '📶', 'Serial': '🔌',
-            'Proxy': '🔀', 'VPNLeak': '🔓',
+            'Proxy': '🔀', 'VPNLeak': '🔓', 'SUSPICIOUS_PATH': '📁',
             # Anti-hack categories
             'SECURITY_EVENT': '🛡️', 'NET_SPAWN': '🐛', 'LISTEN_ANOMALY': '👂',
             'CREDENTIAL_DUMP': '🔑', 'DNS_HIJACK': '🌐', 'SERVICE_CREATE': '🔧',
@@ -40628,6 +44762,7 @@ class GNATracerGUI:
             'SCRIPT_EXEC': 'Script execution (PowerShell/cmd/wscript)',
             'DLL_REGISTER': 'DLL registration (regsvr32 — possible payload)',
             'SCHEDULED_TASK': 'Scheduled task created/modified (persistence)',
+            'SUSPICIOUS_PATH': 'Process running from suspicious location (temp/AppData)',
             'TEMP_EXECUTION': 'Executable running from temp directory',
             'HIGH_RISK_GEO': 'Connection to high-risk country',
             'MIMIC': 'Process mimicking a known service name',
@@ -40861,6 +44996,48 @@ class GNATracerGUI:
                 if meta.get('is_vpn'):
                     w.insert("end", f"  │  │ ⚠ VPN exit:    {meta.get('vpn_provider') or 'provider unknown'}\n",
                              "critical")
+                # §8.8.K.5: inline verifier labels on the BLK card —
+                # operator, serving PoP, aliases, RPKI, PATH check.
+                _brep = ((self._last_full_data or {})
+                         .get('multi_verifications', {}) or {}).get(ip) or {}
+                if _brep:
+                    _bop = (_brep.get('org') or _brep.get('asn_org')
+                            or _brep.get('isp') or '')
+                    if _bop:
+                        w.insert("end", f"  │  │ Operator:      {_bop[:60]}\n", "dim")
+                    if _brep.get('serving_cc'):
+                        w.insert("end",
+                                 f"  │  │ Serving PoP:   "
+                                 f"{_brep.get('serving_city') or '?'},"
+                                 f"{_brep['serving_cc']} "
+                                 f"({_brep.get('serving_src') or '?'})\n",
+                                 "dim")
+                    if _brep.get('edge_city'):
+                        w.insert("end",
+                                 f"  │  │ Edge PoP:      "
+                                 f"{_brep.get('edge_iata') or '?'} → "
+                                 f"{_brep['edge_city']},"
+                                 f"{_brep.get('edge_cc', '?')}\n", "dim")
+                    if _brep.get('aliases'):
+                        w.insert("end",
+                                 f"  │  │ Aliases:       "
+                                 + ', '.join(map(str, _brep['aliases'][:5]))
+                                 + "\n", "dim")
+                    if _brep.get('rpki_state'):
+                        _binv = _brep['rpki_state'] == 'invalid'
+                        w.insert("end",
+                                 f"  │  │ RPKI:          {_brep['rpki_state']}\n",
+                                 "critical" if _binv else "dim")
+                    if _brep.get('path_claimed_km') is not None:
+                        w.insert("end",
+                                 f"  │  │ Path check:    "
+                                 f"{_brep['path_claimed_km']:.0f}km vs ~"
+                                 f"{_brep.get('path_ceiling_km', 0):.0f}km"
+                                 + (" — IMPLAUSIBLE"
+                                    if _brep.get('path_implausible') else "")
+                                 + "\n",
+                                 "critical" if _brep.get('path_implausible')
+                                 else "dim")
                 w.insert("end", "  │  └────────────────────────────────────────────────\n", "dim")
                 # Firewall rule info
                 w.insert("end", f"  │  Firewall Rule:  {self._fw_rule_prefix}{ip}\n", "dim")
@@ -41390,7 +45567,8 @@ class GNATracerGUI:
                         '<th>Category</th><th>Tag</th><th>Icon</th>'
                         '<th>Lat/Lon</th><th>Proxy detail</th><th>Exe</th>'
                         '<th>Parent</th><th>Cmdline</th>'
-                        '<th>First seen</th><th>Last seen</th></tr>')
+                        '<th>First seen</th><th>Last seen</th>'
+                        '<th>MV evidence</th></tr>')
             for c in conns[:300]:
                 _ad = ', '.join(map(str, c.get('all_domains') or []))
                 _op = ', '.join(
@@ -41399,6 +45577,12 @@ class GNATracerGUI:
                 _lp = '; '.join(map(str, (c.get('loc_proof') or [])[:4]))
                 _vl = ', '.join(map(str, c.get('vpn_labels') or []))
                 _cf = '; '.join(map(str, (c.get('verify_conflicts') or [])[:4]))
+                _mvd = '; '.join(
+                    f"{k}={_mv_compact(v)[:40]}"
+                    for k, v in sorted((c.get('mv_detail') or {}).items())
+                    if v not in (None, '', [], {}, (), 0, 0.0, False))
+                if c.get('loc_radius_km') is not None:
+                    _mvd = f"±{c['loc_radius_km']}km " + _mvd
                 html.append(
                     f'<tr><td>{esc(c.get("remote_ip","?"))}</td>'
                     f'<td>{esc(_ad[:80])}</td>'
@@ -41426,7 +45610,11 @@ class GNATracerGUI:
                     f'({esc(c.get("parent_pid",""))})</td>'
                     f'<td>{esc(str(c.get("cmdline",""))[:70])}</td>'
                     f'<td>{esc(_fmt_ts(c.get("first_seen")))}</td>'
-                    f'<td>{esc(_fmt_ts(c.get("last_seen")))}</td></tr>')
+                    f'<td>{esc(_fmt_ts(c.get("last_seen")))}</td>'
+                    # §8.8.K: every collected mv_detail sub-key in the
+                    # export — radius shown alongside so the map pin's
+                    # uncertainty is visible in the report too.
+                    f'<td>{esc(_mvd[:160])}</td></tr>')
             html.append('</table>')
         # Processes
         procs = data.get('processes', [])
@@ -44956,6 +49144,15 @@ class GNATracerGUI:
                 lines.append(f"      Proxy:       {proxy_type} — {c.get('proxy_detail', '')}")
             lines.append(f"      First Seen:  {_fmt_ts(c.get('first_seen', 0))}")
             lines.append(f"      Last Seen:   {_fmt_ts(c.get('last_seen', 0))}")
+            # §8.8.K.2: MultiVerifier detail — every mv_detail sub-key
+            # the pipeline collected for this entry lands in the export.
+            _emd = c.get('mv_detail') or {}
+            _erows = [(k, _mv_compact(v)) for k, v in sorted(_emd.items())
+                      if v not in (None, '', [], {}, (), 0, 0.0, False)]
+            if _erows:
+                lines.append(f"      MultiVerifier detail ({len(_erows)}):")
+                for k, vs in _erows:
+                    lines.append(f"        {k:<22}{vs[:90]}")
         # VPN GATEWAY MODE — when this host terminates tunnels, every
         # tunnel client's REAL pre-tunnel address plus its verification.
         gw = data.get('gateway') or {}
@@ -45999,6 +50196,161 @@ def start_dashboard(get_state_fn, stop_event):
             return PlainTextResponse("401 Unauthorized", status_code=401)
         return JSONResponse(get_state_fn())
 
+    # ---------- P3: watermark injection + flow observation ----------
+    @app.post("/v/inject")
+    async def v_inject(request: Request):
+        """P3: register a watermark pattern. Body {flow?, target?, note?}
+        → {wm_id, gaps_ms}. A cooperating vantage paces bursts on it."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        flow = str(body.get('flow') or body.get('wm_id') or '')
+        res = FLOWCORR.inject_into_flow(
+            flow or f"wm:{int(time.time())}",
+            target=str(body.get('target') or ''),
+            note=str(body.get('note') or ''))
+        return JSONResponse(res)
+
+    @app.post("/v/flow")
+    async def v_flow(request: Request):
+        """P3: a cooperating vantage posts {flow, gaps_ms, src} — returns
+        the correlation score and any watermark match, confidence-tagged."""
+        try:
+            body = await request.json()
+        except Exception:
+            return PlainTextResponse("bad json", status_code=400)
+        res = FLOWCORR.record_flow(
+            str(body.get('flow') or ''),
+            body.get('gaps_ms') or body.get('gaps') or [],
+            src=str(body.get('src') or 'remote'))
+        if res.get('matched'):
+            res = FLOWCORR.confidence_tag(res)
+            try:
+                for ip in _ips_in_text(str(body.get('flow', ''))):
+                    _evgraph.add_edge(ip, str(body.get('src', '')) or ip,
+                                      'watermark_relay', res['confidence'],
+                                      '/v/flow', method='watermark')
+            except Exception:
+                pass
+        return JSONResponse(res)
+
+    @app.get("/v/flow/{flow_id}/pace")
+    async def v_pace(flow_id: str):
+        """P3: pacing advice for an injected flow."""
+        return JSONResponse(FLOWCORR.pace_advice(flow_id))
+
+    @app.post("/v/dossier/outcome")
+    async def v_dossier_outcome(request: Request):
+        """P17.3: legal-process outcome feedback — the analyst records
+        whether a filed dossier's relay request confirmed the subscriber
+        (true_pos) or not (false_pos); every edge method in the component
+        is scored via P16's OutcomeTracker."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        ckey = body.get('cluster', '') or body.get('ckey', '')
+        confirmed = bool(body.get('confirmed'))
+        if not ckey:
+            return JSONResponse({'error': 'cluster required'}, status_code=400)
+        return JSONResponse(DossierGenerator.record_outcome(ckey, confirmed))
+
+    # ---------- P19/P20: federation ----------
+    def _fed_auth(request: Request) -> str:
+        """Monitor-ID auth — unknown IDs get 401."""
+        mid = request.headers.get('x-mon', '') or \
+            request.query_params.get('mon', '')
+        return mid if mid and _federation.known_peer(mid) else ''
+
+    @app.post("/federation/reputation")
+    async def fed_reputation(request: Request):
+        """P19/P20: a known peer pushes signed reputation records.
+        Unknown monitor → 401; verified records land in _reputation and
+        contradicting ones are queued for the reasoner."""
+        mid = _fed_auth(request)
+        if not mid:
+            return PlainTextResponse("401 unknown monitor", status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return PlainTextResponse("bad json", status_code=400)
+        sig = request.headers.get('x-sig', '')
+        raw = json.dumps(body, sort_keys=True).encode()
+        if sig and not _federation.verify_sig(mid, raw, sig):
+            return PlainTextResponse("401 bad signature", status_code=401)
+        n = 0
+        for rec in body.get('records', [])[:200]:
+            ip = str(rec.get('ip') or '')
+            if not ip:
+                continue
+            _reputation.put(ip, rec, monitor_id=mid)
+            _federation.report_reputation(
+                ip, float(rec.get('conf', 0.5)), reporter=mid)
+            # contradiction check vs local verdict
+            try:
+                local = {}
+                mon = _ACTIVE_MONITOR
+                if mon is not None:
+                    local = mon._verify_cache.get(ip) or {}
+                lv = (local.get('is_vpn') is True and
+                      str(rec.get('kind', '')).lower() in ('residential', 'isp'))
+                if lv:
+                    _federation.note_contradiction(ip, rec)
+            except Exception:
+                pass
+            n += 1
+        return JSONResponse({'accepted': n})
+
+    @app.post("/federation/rtt")
+    async def fed_rtt(request: Request):
+        """P29: a peer posts RTT vantages {ip, rtt_ms, lat, lon} — feeds
+        federated trilateration (the MV-FEDERATED-RTT geo path)."""
+        mid = _fed_auth(request)
+        if not mid:
+            return PlainTextResponse("401 unknown monitor", status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return PlainTextResponse("bad json", status_code=400)
+        n = 0
+        for rec in body.get('vantages', body if isinstance(body, list) else []):
+            try:
+                _federation.record_rtt(
+                    str(rec.get('ip', '')), mid,
+                    float(rec.get('rtt_ms', 0)),
+                    float(rec.get('lat', 0)), float(rec.get('lon', 0)))
+                n += 1
+            except Exception:
+                continue
+        return JSONResponse({'accepted': n})
+
+    @app.get("/federation/trilaterate/{ip}")
+    async def fed_trilat(ip: str, request: Request):
+        """P29: the fused MV-FEDERATED-RTT location for an IP."""
+        return JSONResponse(_federated_trilaterator.trilaterate(ip))
+
+    @app.post("/federation/cluster")
+    async def fed_cluster(request: Request):
+        """P20: signed cluster exchange — a peer shares an actor cluster."""
+        mid = _fed_auth(request)
+        if not mid:
+            return PlainTextResponse("401 unknown monitor", status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return PlainTextResponse("bad json", status_code=400)
+        sig = request.headers.get('x-sig', '')
+        raw = json.dumps(body, sort_keys=True).encode()
+        if sig and not _federation.verify_sig(mid, raw, sig):
+            return PlainTextResponse("401 bad signature", status_code=401)
+        ips = [i for i in body.get('ips', [])[:50] if _is_public_ip_cached(i)]
+        for i in range(len(ips)):
+            for j in range(i + 1, len(ips)):
+                _evgraph.add_edge(ips[i], ips[j], 'federated_reputation',
+                                  0.6, f'federation:{mid}', method='federated')
+        return JSONResponse({'accepted': len(ips)})
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket):
         import asyncio
@@ -46057,6 +50409,9 @@ class MedianBoxMonitor:
         self.probe_attempts = defaultdict(int)
         self._probe_window_start = time.time()
         self.mac_to_ip_history = defaultdict(set)
+        # Reverse index ip -> {macs} — the L2-spoof dup check is an O(1)
+        # lookup here instead of an O(all-MACs) scan per binding.
+        self._ip_to_macs = defaultdict(set)
         self.last_alert = defaultdict(float)
 
         # Connection cache — populated by dedicated mapper thread
@@ -47093,7 +51448,8 @@ class MedianBoxMonitor:
         "IDLE_ANOMALY": EMOJI['idle'], "ML_ANOMALY": EMOJI['ml'],
     }
 
-    def _add_deduction(self, severity, category, proc_name, pid, message, evidence, score):
+    def _add_deduction(self, severity, category, proc_name, pid, message,
+                       evidence, score, mv_detail=None):
         cooldown_key = f"{category}:{pid}:{hash(message[:80])}"
         now = time.time()
         # Single lock for cooldown check + deduction append + risk update
@@ -47112,6 +51468,8 @@ class MedianBoxMonitor:
                     severity = "CRITICAL"
 
             d = Deduction(now, severity, category, proc_name, pid, message, evidence, escalated_score)
+            if mv_detail:
+                d.mv_detail = dict(mv_detail)
             self.deductions.append(d)
             self._ded_fmt.append({
                 'time': _fmt_hms(int(now)),
@@ -49339,6 +53697,20 @@ class MedianBoxMonitor:
         _ippr = int(_ip.proto) if has_ip else 0
         _iptos = int(_ip.tos) if has_ip else 0
         _ipopt = _ip.options if has_ip else []
+        # One timestamp per packet — scapy stamps capture time in pkt.time
+        # (more accurate than processing time AND free); ~15 table writes
+        # below share it instead of ~36 _pkt_now calls.
+        _pkt_now = getattr(pkt, 'time', None) or time.time()
+        # Layer-type index — one pass replaces every pkt.haslayer() /
+        # pkt[Cls] re-walk below. getlayer semantics preserved: the map
+        # keeps the FIRST layer of each type.
+        _ltypes = set()
+        _lmap = {}
+        for _l in _ls:
+            _t = type(_l)
+            _ltypes.add(_t)
+            if _t not in _lmap:
+                _lmap[_t] = _l
 
         # WIRETALK — every source MAC on the wire is a signal-emitting
         # device worth tracing, whatever rides on top: IP, ARP, raw
@@ -49355,11 +53727,11 @@ class MedianBoxMonitor:
                 _r = _l2w.get(_sm)
                 if _r is None and len(_l2w) < int(
                         CONFIG.get('rf_l2_wire_max', 4096)):
-                    _r = _l2w[_sm] = {'first': time.time(), 'last': 0.0,
+                    _r = _l2w[_sm] = {'first': _pkt_now, 'last': 0.0,
                                       'pkts': 0, 'ets': set(),
                                       'ips': set(), 'svc': set()}
                 if _r is not None:
-                    _r['last'] = time.time()
+                    _r['last'] = _pkt_now
                     _r['pkts'] += 1
                     if len(_r['ets']) < 12:
                         _r['ets'].add(int(_eth.type))
@@ -49411,11 +53783,10 @@ class MedianBoxMonitor:
         # identity entirely (QinQ/MPLS-lite shape).
         if has_ether and Dot1Q is not None:
             try:
-                if pkt.haslayer(Dot1Q) and \
-                        pkt[Dot1Q].payload.haslayer(Dot1Q):
+                if sum(1 for _l in _ls if type(_l) is Dot1Q) >= 2:
                     _qc = getattr(self, '_qinq_cd', 0)
-                    if time.time() - _qc > 3600:
-                        self._qinq_cd = time.time()
+                    if _pkt_now - _qc > 3600:
+                        self._qinq_cd = _pkt_now
                         self._add_deduction(
                             "WARNING", "QINQ", "packet", 0,
                             f"QINQ DOUBLE TAG: {_eth.src} emits "
@@ -49426,7 +53797,11 @@ class MedianBoxMonitor:
                 pass
 
         if has_dns:
-            self.dns_cache.process_packet(pkt)
+            # Pass the already-walked layer + src — process_packet skips
+            # its own haslayer/getlayer re-walks and field materialization.
+            self.dns_cache.process_packet(
+                pkt, dns_layer=_dns,
+                src_ip=_ipsrc if has_ip else '?')
             # _dns.fields is the RAW field dict — _dns.qd/_dns.an would
             # go through scapy's getfieldval, which do_copy()s every
             # PacketField (a full sub-packet clone per access, per
@@ -49725,7 +54100,7 @@ class MedianBoxMonitor:
                                         self._fflux = _ff
                                     if len(_ff) < 4000:
                                         _ips = _ff.setdefault(_dm, {})
-                                        _now = time.time()
+                                        _now = _pkt_now
                                         _ips[_rd] = _now
                                         _ips = {k: v for k, v in
                                                 _ips.items()
@@ -50148,9 +54523,9 @@ class MedianBoxMonitor:
             # the active sweep uses, flag the flip-flop (two MACs
             # claiming one IP = the poisoner pair), and count is-at
             # storms (a poisoner floods claims).
-            if pkt.haslayer(ARP):
+            if ARP is not None and ARP in _ltypes:
                 try:
-                    _a = pkt[ARP]
+                    _a = _lmap[ARP]
                     # WIRETALK enrichment — the ARP speaker's MAC is the
                     # emitter; the op names its role (who-has requester /
                     # is-at claimer) and psrc is the L3 identity it claims
@@ -50173,14 +54548,17 @@ class MedianBoxMonitor:
                         if _own is None and len(_mh) < 20000:
                             _own = _mh[_a.hwsrc] = set()
                         _dup = any(_om != _a.hwsrc
-                                   and _a.psrc in _i2
-                                   for _om, _i2 in _mh.items())
+                                   for _om in self._ip_to_macs.get(
+                                       _a.psrc, ()))
                         if _own is not None and len(_own) < 256:
                             _own.add(_a.psrc)
+                            if len(self._ip_to_macs) < 20000 \
+                                    or _a.psrc in self._ip_to_macs:
+                                self._ip_to_macs[_a.psrc].add(_a.hwsrc)
                         if _dup:
                             _cd = getattr(self, '_l2sp_cd', 0)
-                            if time.time() - _cd > 3600:
-                                self._l2sp_cd = time.time()
+                            if _pkt_now - _cd > 3600:
+                                self._l2sp_cd = _pkt_now
                                 self._add_deduction(
                                     "CRITICAL", "L2SPOOF", "packet", 0,
                                     f"ARP SPOOF PAIR: {_a.psrc} claimed "
@@ -50196,7 +54574,7 @@ class MedianBoxMonitor:
                             _gs = {}
                             self._arp_isat = _gs
                         _gk = _gs.get(_a.hwsrc)
-                        _gn = time.time()
+                        _gn = _pkt_now
                         if _gk is None or _gn - _gk[1] > 60:
                             _gk = [set(), _gn, 0]    # ips, win, last_alert
                             if len(_gs) < 512:
@@ -50257,12 +54635,12 @@ class MedianBoxMonitor:
                     and src == self.local_ip and _is_public_ip_cached(dst):
                 _os_ = self._out_syn
                 if len(_os_) >= 4000:
-                    _cut = time.time() - 60
+                    _cut = _pkt_now - 60
                     for _k in [k for k, v in list(_os_.items())[:2000]
                                if v < _cut]:
                         _os_.pop(_k, None)
                 if len(_os_) < 4000:
-                    _os_[(dst, dport)] = time.time()
+                    _os_[(dst, dport)] = _pkt_now
                 # KNOCK — a burst of SYNs to many DISTINCT ports on one
                 # remote inside the window is a knock sequence: the
                 # remote is a knock-server whose real service opens
@@ -50276,7 +54654,7 @@ class MedianBoxMonitor:
                     _kp = {}
                     _kn[dst] = _kp
                 if _kp is not None:
-                    _nowk = time.time()
+                    _nowk = _pkt_now
                     _kp[dport] = _nowk
                     _livep = {p: t for p, t in _kp.items()
                               if _nowk - t < _KNOCK_WINDOW_S}
@@ -50295,7 +54673,7 @@ class MedianBoxMonitor:
                 _sport = _tsport
                 _t0 = self._out_syn.pop((src, _sport), None)
                 if _t0:
-                    _ms = (time.time() - _t0) * 1000.0
+                    _ms = (_pkt_now - _t0) * 1000.0
                     if 0 < _ms < 30000:
                         _cur = self._remote_ts_rtt.get(src)
                         if _cur is None or _ms < _cur:
@@ -50422,7 +54800,7 @@ class MedianBoxMonitor:
                         try:
                             _xd = 0
                             for _xc in _IPV6_EXT_CLASSES:
-                                if pkt.haslayer(_xc):
+                                if _xc in _ltypes:
                                     _xd += 1
                                     if _xc.__name__ == \
                                             'IPv6ExtHdrFragment':
@@ -50435,7 +54813,7 @@ class MedianBoxMonitor:
                                     elif _xc.__name__ == \
                                             'IPv6ExtHdrRouting':
                                         try:
-                                            if int(pkt[_xc].type) == 0:
+                                            if int(_lmap[_xc].type) == 0:
                                                 _w['rh0'] = _w.get(
                                                     'rh0', 0) + 1
                                         except Exception:
@@ -50663,11 +55041,16 @@ class MedianBoxMonitor:
                             _fe = _fr.get(_rport)
                             if _fe is None:
                                 if len(_fr) < 64:
-                                    _fe = {'ts': [], 'sz': {}}
+                                    _fe = {'ts': [], 'sz': {},
+                                           'out': 0, 'inn': 0}
                                     _fr[_rport] = _fe
                             if _fe is not None:
                                 if len(_fe['ts']) < 48:
-                                    _fe['ts'].append(time.time())
+                                    _fe['ts'].append(_pkt_now)
+                                if src == self.local_ip:
+                                    _fe['out'] += 1
+                                else:
+                                    _fe['inn'] += 1
                                 _l4 = (_lpay(_tcp.payload) if has_tcp
                                        else (_lpay(_udp.payload)
                                              if has_udp else 0))
@@ -50765,6 +55148,12 @@ class MedianBoxMonitor:
                         _wo = self._remote_wire.get(_pv)
                         if _wo is not None:
                             _wo['salink'] = f"{_kind}:{_remote}"
+                        try:
+                            _said = f"{_kind}:{bytes(_key).hex()[:24]}"
+                            SALINK_GRAPH.observe(_said, _remote)
+                            SALINK_GRAPH.observe(_said, _pv)
+                        except Exception:
+                            pass
 
                 if has_ip and not (has_tcp or has_udp or has_dns):
                     _pr = _ippr
@@ -50918,7 +55307,7 @@ class MedianBoxMonitor:
                             _fo[_lp] = _st
                         if _st is not None and (
                                 len(_st) < 128 or dst in _st):
-                            _st[dst] = time.time()
+                            _st[dst] = _pkt_now
                             if len(_st) >= _P2P_FANOUT_MIN:
                                 _w['p2p'] = _lp
                                 for _rip in _st:
@@ -51156,9 +55545,9 @@ class MedianBoxMonitor:
                 _il = self._remote_ipid.get(src)
                 if _il is None:
                     if len(self._remote_ipid) < 8000:
-                        self._remote_ipid[src] = [(time.time(), _ipidf2)]
+                        self._remote_ipid[src] = [(_pkt_now, _ipidf2)]
                 elif len(_il) < 10:
-                    _il.append((time.time(), _ipidf2))
+                    _il.append((_pkt_now, _ipidf2))
                 # IPIDLINK — sequential-ID kernels share ONE counter
                 # across all their addresses: two different remotes
                 # whose IDs interleave inside a few ticks are the SAME
@@ -51203,9 +55592,9 @@ class MedianBoxMonitor:
                         _g = _gwp.get(_key)
                         if _g is None:
                             if len(_gwp) < 4000:
-                                _gwp[_key] = [time.time(), time.time(), 1]
+                                _gwp[_key] = [_pkt_now, _pkt_now, 1]
                         else:
-                            _g[1] = time.time()
+                            _g[1] = _pkt_now
                             _g[2] += 1
 
         # Gateway inner-flow meter — packets whose endpoints sit inside a
@@ -51266,9 +55655,9 @@ class MedianBoxMonitor:
                         _sl = self._remote_ts.get(src)
                         if _sl is None:
                             if len(self._remote_ts) < 8000:
-                                self._remote_ts[src] = [(time.time(), _tv)]
+                                self._remote_ts[src] = [(_pkt_now, _tv)]
                         else:
-                            _sl.append((time.time(), _tv))
+                            _sl.append((_pkt_now, _tv))
                             del _sl[:-8]
                         # TSLINK — the TSval clock is per-kernel: two
                         # DIFFERENT remotes answering inside the same
@@ -51386,7 +55775,7 @@ class MedianBoxMonitor:
                     _s = {}
                     _mi[mac] = _s
                 if _s is not None:
-                    _now_m = time.time()
+                    _now_m = _pkt_now
                     _is_new = src not in _s
                     _s[src] = _now_m
                     _live = {k: v for k, v in _s.items()
@@ -51429,8 +55818,8 @@ class MedianBoxMonitor:
                     if _te is not None:
                         _te[0] += 1
                         if _te[0] >= 3 and \
-                                time.time() - _te[1] > 3600:
-                            _te[1] = time.time()
+                                _pkt_now - _te[1] > 3600:
+                            _te[1] = _pkt_now
                             self._add_deduction(
                                 "WARNING", "TTLINJ", "packet", 0,
                                 f"ROUTE-INJECTION: {src} (MAC {mac}) "
@@ -51459,8 +55848,8 @@ class MedianBoxMonitor:
                 if len(_dh) < 64 or mac in _dh:
                     _dh[mac] = src
                 if len(_dh) >= 2 and \
-                        time.time() - _dh.get('_last', 0) > 3600:
-                    _dh['_last'] = time.time()
+                        _pkt_now - _dh.get('_last', 0) > 3600:
+                    _dh['_last'] = _pkt_now
                     _sv = {k: v for k, v in _dh.items()
                            if k != '_last'}
                     self._add_deduction(
@@ -51484,8 +55873,8 @@ class MedianBoxMonitor:
             try:
                 _hid = ''
                 if _udport == 67 and \
-                        pkt.haslayer(BOOTP) and pkt.haslayer(DHCP):
-                    for opt in pkt[DHCP].options:
+                        BOOTP in _ltypes and DHCP in _ltypes:
+                    for opt in _lmap[DHCP].options:
                         if isinstance(opt, tuple) \
                                 and opt[0] == 'hostname':
                             _hid = (opt[1].decode(errors='ignore')
@@ -51600,7 +55989,7 @@ class MedianBoxMonitor:
                         _nm = {}
                         self._llmns = _nm
                     _st2 = _nm.get(mac)
-                    _now = time.time()
+                    _now = _pkt_now
                     if _st2 is None and len(_nm) < 64:
                         _st2 = [_now, set(), 0]
                         _nm[mac] = _st2
@@ -51631,8 +56020,8 @@ class MedianBoxMonitor:
         # hijacks a whole v6 LAN (the v6 form of RDHCP).
         if has_ipv6 and mac and (ICMPv6ND_NA or ICMPv6ND_RA):
             try:
-                if ICMPv6ND_NA and pkt.haslayer(ICMPv6ND_NA):
-                    _tg = str(pkt[ICMPv6ND_NA].tgt)
+                if ICMPv6ND_NA and ICMPv6ND_NA in _ltypes:
+                    _tg = str(_lmap[ICMPv6ND_NA].tgt)
                     # WIRETALK — NA speaker: neighbor role + the v6
                     # target it claims as its own identity.
                     _l2w = getattr(self, '_l2_wire', None)
@@ -51649,14 +56038,17 @@ class MedianBoxMonitor:
                     _own6 = _mh6.get(mac)
                     if _own6 is None and len(_mh6) < 20000:
                         _own6 = _mh6[mac] = set()
-                    _dup6 = any(_om != mac and _tg in _i2
-                                for _om, _i2 in _mh6.items())
+                    _dup6 = any(_om != mac
+                                for _om in self._ip_to_macs.get(_tg, ()))
                     if _own6 is not None and len(_own6) < 256:
                         _own6.add(_tg)
+                        if len(self._ip_to_macs) < 20000 \
+                                or _tg in self._ip_to_macs:
+                            self._ip_to_macs[_tg].add(mac)
                     if _dup6:
                         _cd6 = getattr(self, '_l2sp_cd', 0)
-                        if time.time() - _cd6 > 3600:
-                            self._l2sp_cd = time.time()
+                        if _pkt_now - _cd6 > 3600:
+                            self._l2sp_cd = _pkt_now
                             self._add_deduction(
                                 "CRITICAL", "L2SPOOF", "packet", 0,
                                 f"NDP SPOOF PAIR: {_tg} claimed by {mac} "
@@ -51665,7 +56057,7 @@ class MedianBoxMonitor:
                                 f"(v6 ARP MITM)",
                                 [f"target {_tg}", f"claimant {mac}"],
                                 30.0)
-                if ICMPv6ND_RA and pkt.haslayer(ICMPv6ND_RA):
+                if ICMPv6ND_RA and ICMPv6ND_RA in _ltypes:
                     # WIRETALK — RA speaker: self-declared IPv6 router.
                     _l2w = getattr(self, '_l2_wire', None)
                     _l2rec = _l2w.get(_eth.src) if _l2w else None
@@ -51681,8 +56073,8 @@ class MedianBoxMonitor:
                     if len(_ra) < 64 or mac in _ra:
                         _ra[mac] = src
                     if len(_ra) >= 2 and \
-                            time.time() - _ra.get('_last', 0) > 3600:
-                        _ra['_last'] = time.time()
+                            _pkt_now - _ra.get('_last', 0) > 3600:
+                        _ra['_last'] = _pkt_now
                         _rs = {k: v for k, v in _ra.items()
                                if k != '_last'}
                         self._add_deduction(
@@ -51701,8 +56093,41 @@ class MedianBoxMonitor:
         ja4s = self.ja4plus.ja4s(pkt)
         ja4h = self.ja4plus.ja4h(pkt)
 
+        # P0.3: inbound TLS ClientHello from a public source — the remote
+        # client's composite fingerprint joins every egress it has been
+        # seen from in SESSIONS. Guarded on the ClientHello record marker
+        # so the parse cost is paid only where it can succeed.
+        if has_tcp and has_raw and src != self.local_ip \
+                and _is_public_ip_cached(src):
+            try:
+                _rl = _raw.load
+                if not isinstance(_rl, bytes):
+                    _rl = bytes(_rl)
+                if len(_rl) > 10 and _rl[0] == 0x16 and _rl[1] == 0x03 \
+                        and _rl[5] == 0x01:
+                    _cja4 = self.ja4plus.ja4(pkt)
+                    if _cja4:
+                        _cfp = compute_client_fp(ja4=_cja4, ja4s=ja4s,
+                                                 ja4h=ja4h)
+                        SESSIONS.observe(_cfp, src)
+                        _fp_diversity.observe(src, _cfp)
+            except Exception:
+                pass
+        # P0.1 sibling: H2 SETTINGS hash strengthens the fp when present.
+        if has_tcp and has_raw and _is_public_ip_cached(
+                src if src != self.local_ip else dst):
+            try:
+                _h2 = parse_h2_settings(pkt)
+                if _h2:
+                    _rem = src if src != self.local_ip else dst
+                    _cfp2 = compute_client_fp(h2_settings=_h2,
+                                              ja4h=ja4h or '')
+                    SESSIONS.observe(_cfp2, _rem)
+            except Exception:
+                pass
+
         comp_key = self._composite_key(mac, src)
-        now = time.time()
+        now = _pkt_now
 
         # Packet-read fingerprint work happens BEFORE the lock — a miss here is
         # ~never (same key re-checked inside the lock), and the hit path stays
@@ -51756,6 +56181,9 @@ class MedianBoxMonitor:
                 self._dev_scan_q.put_nowait((comp_key, src))
             except queue.Full:
                 pass
+
+        proto = _ippr if has_ip else 0
+        sport = _tsport if has_tcp else (_usport if has_udp else 0)
 
         # Inbound SYN detection — detect port scans targeting us
         if has_tcp and _tfl & 0x02 and dst == self.local_ip and src != self.local_ip:
@@ -51841,12 +56269,16 @@ class MedianBoxMonitor:
                 if known_ips is None and len(self.mac_to_ip_history) < 20000:
                     known_ips = self.mac_to_ip_history[mac] = set()
                 if known_ips is not None and src not in known_ips:
-                    for other_mac, ips in self.mac_to_ip_history.items():
-                        if other_mac != mac and src in ips:
-                            arp_spoof_mac = (mac, src)
-                            break
+                    # O(1) via the reverse index — was an O(all-MACs)
+                    # items() scan inside the packet-path lock.
+                    if any(_om != mac
+                           for _om in self._ip_to_macs.get(src, ())):
+                        arp_spoof_mac = (mac, src)
                     if len(known_ips) < 256:
                         known_ips.add(src)
+                        if len(self._ip_to_macs) < 20000 \
+                                or src in self._ip_to_macs:
+                            self._ip_to_macs[src].add(mac)
 
         if probe_count > 7:
             self._safe_alert(f"{EMOJI['probe']} Active probe -> {src} ({probe_count} SYN attempts)", Colors.R)
@@ -51946,6 +56378,70 @@ class MedianBoxMonitor:
             except Exception as e:
                 _logger.warning("Sniff error: %s — retrying in %ss", e, CONFIG.get('sniff_retry_interval', 2))
                 time.sleep(CONFIG.get('sniff_retry_interval', 2))
+
+    def _graph_reasoner_thread(self):
+        """P13: run the GraphReasoner every 60s. Deduction rows route
+        through _add_deduction (Deductions tab + DB + SIEM + alerter);
+        _pending one-shot events do the same; probe results feed back
+        as probe_match edges; federated share runs on its own timer."""
+        _fed_ts = 0.0
+        while not self.stop.is_set():
+            try:
+                deductions = _graph_reasoner.run(self)
+                for d in deductions:
+                    try:
+                        self._add_deduction(d.severity, d.category,
+                                            d.process_name, d.pid,
+                                            d.message, list(d.evidence),
+                                            d.score,
+                                            mv_detail=getattr(d, 'mv_detail', None))
+                    except Exception:
+                        pass
+                # Producer events the reasoner queued this pass —
+                # optional 6th tuple element carries the IP's mv_detail
+                # so SIEM/webhook payloads keep the full evidence (§8.8.K.7).
+                for item in _graph_reasoner._pending:
+                    try:
+                        cat, sev, msg, ev, score = item[:5]
+                        self._add_deduction(sev, cat, '', 0, msg,
+                                            list(ev), score,
+                                            mv_detail=item[5] if len(item) > 5 else None)
+                    except Exception:
+                        pass
+                _graph_reasoner._pending.clear()
+                # P18: active-probe results → probe_match edges
+                try:
+                    for res in _active_prober.drain():
+                        ip = res.get('ip', '')
+                        cl = res.get('cluster', '')
+                        if res.get('kind') == 'tls_cert' and ip:
+                            if cl:
+                                for peer in cl.split(','):
+                                    if peer and peer != ip and \
+                                            _is_public_ip_cached(peer):
+                                        _evgraph.add_edge(
+                                            ip, peer, 'probe_match', 0.6,
+                                            'ActiveProber', method='probe')
+                        elif res.get('kind') == 'rtt' and ip:
+                            _federation.record_rtt(ip, 'local',
+                                                   res.get('rtt_ms', 0))
+                except Exception:
+                    pass
+                # P20.2: federated share every 5 min
+                now = time.time()
+                if now - _fed_ts > 300:
+                    _fed_ts = now
+                    try:
+                        recs = [{'ip': ip, 'kind': 'vpn',
+                                 'conf': rec.get('vpn_score', 0.5)}
+                                for ip, rec in list(self._verify_cache.items())[:50]
+                                if isinstance(rec, dict) and rec.get('is_vpn')]
+                        _federation.share_tick(recs)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.stop.wait(60.0)
 
     def _status_thread(self):
         while not self.stop.is_set():
@@ -52674,15 +57170,26 @@ class MedianBoxMonitor:
 
     # ====================== RUN ======================
     def run(self):
-        # Same interpreter tuning as the GNA host process: a wider GIL
-        # switch interval cuts scheduler churn across the dozens of I/O
-        # threads, and a larger gen-0 threshold halves collection passes.
-        sys.setswitchinterval(0.05)
-        gc.set_threshold(50000)
-        # Freeze startup objects (baselines, patterns, monitor state) so
-        # cyclic GC never rescans them for the life of the process.
+        global _ACTIVE_MONITOR
+        _ACTIVE_MONITOR = self
+        _active_prober.set_monitor(self)
+        _active_prober.start()
+        # P14: restore persisted Welford behavior models (baseline survives
+        # restart — a cold-start can't be exploited to reset the baseline).
         try:
-            gc.freeze()
+            for key, st in self.db.load_behavior_models().items():
+                wb = WelfordBaseline()
+                wb._n = int(st.get('n', 0))
+                wb._mean = float(st.get('mean', 0.0))
+                wb._m2 = float(st.get('m2', 0.0))
+                _welford_registry[key] = wb
+        except Exception:
+            pass
+        # P20.1: load known federation peers (idempotent — the constructor
+        # already tried once, this also picks up a later-placed file).
+        try:
+            _federation.load_peers(CONFIG.get('attribution_known_monitors_file',
+                                            'known_monitors.json'))
         except Exception:
             pass
         # Start packet pipeline workers
@@ -52706,6 +57213,7 @@ class MedianBoxMonitor:
             threading.Thread(target=self._process_watcher, daemon=True, name="Process-Watcher"),
             threading.Thread(target=self._status_thread, daemon=True, name="Status-Reporter"),
             threading.Thread(target=self.conn_inventory.run_thread, daemon=True, name="Connection-Inventory"),
+            threading.Thread(target=self._graph_reasoner_thread, daemon=True, name="Graph-Reasoner"),
         ]
         if self._admin_mode:
             threads.append(threading.Thread(target=self._arp_thread, daemon=True, name="ARP-Scanner"))

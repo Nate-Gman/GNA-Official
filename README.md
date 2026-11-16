@@ -7,9 +7,11 @@ shared content and users, and interact live — all from a browser-like
 dashboard UI.
 
 It also ships with **MedianBox / GNA Tracer**, a full network-intelligence
-monitor (packet pipeline, GeoIP map, process/connection tracing, threat
-detection, and a tkinter "GNA Tracer" window) that launches alongside the main
-program.
+monitor — packet pipeline, GeoIP/provider-range enrichment, process and
+connection tracing, Welford baselines, TLS/JA4+ fingerprinting, VPN/proxy
+multi-verification, evidence-graph reasoning, flow watermarking, signed
+federation exchange, and an 18-tab tkinter "GNA Tracer" window — that
+launches alongside the main program.
 
 ---
 
@@ -124,7 +126,7 @@ known peers, join time, vault).
 ## Troubleshooting
 
 - **Slow launch** — always start through `GNA.bat` / `GNA.py`. Running
-  `python Main_monolith.py` directly recompiles the whole 3.4 MB file every
+  `python Main_monolith.py` directly recompiles the whole ~3.5 MB file every
   time because `__main__` never uses the `.pyc` cache.
 - **`Sender.py: NOT DETECTED`** right after start — the status probe caches
   its result for a few seconds; it updates on the next refresh. If it stays
@@ -145,7 +147,7 @@ known peers, join time, vault).
 |-----------------------------|-----------------------------------------------------|
 | `Main_monolith.py`          | The entire application (dashboard + monitor + relay + sender source) |
 | `GNA.py` / `GNA.bat`        | Launchers (use the cached `.pyc` — fastest startup) |
-| `medianbox_monitor_v2.py`   | Standalone copy of the monitor (launch fallback)    |
+| `medianbox_monitor_v2.py`   | Standalone monitor — source of truth for the copy embedded in `Main_monolith.py`; also the launch fallback |
 | `sender.py`                 | Screen-share sender (regenerated if missing)        |
 | `smoke_test.py`             | Route/render smoke test — `python smoke_test.py`    |
 | `_jscheck.py`               | Validates embedded `<script>` blocks                |
@@ -160,7 +162,9 @@ known peers, join time, vault).
 Python 3.10+, Windows (primary target). Packages: `flask`, `requests`,
 `zeroconf`, `python-socketio`, `uvicorn`, `fastapi`, `Pillow`, `psutil`,
 `cryptography`, `mss`, `geoip2`, `manuf`; `scapy` + Npcap for packet capture
-(runs degraded without it); `tkinter` for the GNA Tracer window.
+(runs degraded without it); `tkinter` for the GNA Tracer window; `PyNaCl`
+for Ed25519-signed federation records and `pywin32` for event-log/file
+forensics (both optional, feature-detected).
 
 ## Verification
 
